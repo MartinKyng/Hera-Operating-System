@@ -1,0 +1,292 @@
+# Hera OS production stack (Phase 9).
+#
+# Usage:
+#   cp .env.example deploy/.env
+#   # replace every image digest + secret/domain value, then:
+#   docker compose -f deploy/docker-compose.prod.yml up -d --wait
+#   # then open https://$HERA_DOMAIN — the /setup wizard creates the first
+#   # company + Administrator (ADR-016). Or: deploy/install.sh does all of it.
+#
+# Production differs from the dev stack on purpose: no bind mounts, no source
+# builds, no published Postgres/Redis ports, automatic HTTPS through Caddy, and
+# the same pinned image@sha256 digest every time the VM restarts. The one-shot
+# `migrate` service brings the schema to head before api/worker start.
+
+name: hera-prod
+
+x-prod-logging: &prod-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-prod-common: &prod-common
+  restart: unless-stopped
+  logging: *prod-logging
+  security_opt: ["no-new-privileges:true"]
+
+x-api-env: &api-env
+  HERA_IN_CONTAINER: "1"
+  HERA_ENV: prod
+  HERA_DOMAIN: ${HERA_DOMAIN:?set in deploy/.env}
+  HERA_SECRET_KEY: ${HERA_SECRET_KEY:?set in deploy/.env}
+  HERA_SECRET_KEY_PREVIOUS: ${HERA_SECRET_KEY_PREVIOUS:-}
+  HERA_DEFAULT_CURRENCY: ${HERA_DEFAULT_CURRENCY:-NGN}
+  HERA_DEFAULT_TIMEZONE: ${HERA_DEFAULT_TIMEZONE:-Africa/Lagos}
+  HERA_DATABASE_URL: postgresql+asyncpg://hera_app:${HERA_DB_APP_PASSWORD:?set in deploy/.env}@hera-db:5432/${POSTGRES_DB:-hera}
+  HERA_MIGRATE_DATABASE_URL: postgresql+asyncpg://hera_migrate:${HERA_DB_MIGRATE_PASSWORD:?set in deploy/.env}@hera-db:5432/${POSTGRES_DB:-hera}
+  HERA_REDIS_URL: redis://:${REDIS_PASSWORD:?set in deploy/.env}@hera-redis:6379/0
+  HERA_PG_HOST: hera-db
+  HERA_PG_PORT: "5432"
+  HERA_PG_DB: ${POSTGRES_DB:-hera}
+  HERA_PG_BACKUP_PASSWORD: ${HERA_DB_BACKUP_PASSWORD:?set in deploy/.env}
+  HERA_PG_MIGRATE_PASSWORD: ${HERA_DB_MIGRATE_PASSWORD:?set in deploy/.env}
+  HERA_ADMIN_EMAIL: ${HERA_ADMIN_EMAIL:-}
+  HERA_ADMIN_PASSWORD: ${HERA_ADMIN_PASSWORD:-}
+  HERA_CORS_ORIGINS: ${HERA_CORS_ORIGINS:?set to https://your-domain}
+  HERA_TRUSTED_HOSTS: ${HERA_TRUSTED_HOSTS:?set to your-domain,127.0.0.1,hera-api}
+  HERA_PUBLIC_BASE_URL: ${HERA_PUBLIC_BASE_URL:-}
+  HERA_PAYMENTS_STUB: "0"
+  HERA_MESSAGING_STUB: "0"
+  HERA_REQUIRE_MFA: "1"
+  HERA_BACKUP_DIR: /backups
+  # Attachment bytes live on the hera-files volume, not in the database or the
+  # container filesystem — same rule as the dev stack: pg_dump backs up the
+  # books, and a file store that grows with five years of scans must not make
+  # "restore the site" mean "wait for the PDFs". The image creates
+  # /var/lib/hera/files (owned by the runtime user) so a fresh named volume
+  # inherits the right ownership.
+  HERA_FILES_DIR: /var/lib/hera/files
+
+services:
+  db:
+    <<: *prod-common
+    image: postgres:16-alpine@sha256:${HERA_POSTGRES_DIGEST:?pin postgres digest}
+    hostname: hera-db
+    networks:
+      default:
+        aliases: [hera-db]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hera}
+      POSTGRES_USER: ${POSTGRES_USER:-hera_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in deploy/.env}
+      HERA_DB_APP_PASSWORD: ${HERA_DB_APP_PASSWORD:?set in deploy/.env}
+      HERA_DB_MIGRATE_PASSWORD: ${HERA_DB_MIGRATE_PASSWORD:?set in deploy/.env}
+      HERA_DB_BACKUP_PASSWORD: ${HERA_DB_BACKUP_PASSWORD:?set in deploy/.env}
+    volumes:
+      - hera-db-data:/var/lib/postgresql/data
+      - ./postgres/init-roles.sh:/docker-entrypoint-initdb.d/10-init-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+
+  redis:
+    <<: *prod-common
+    image: redis:7-alpine@sha256:${HERA_REDIS_DIGEST:?pin redis digest}
+    hostname: hera-redis
+    networks:
+      default:
+        aliases: [hera-redis]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set in deploy/.env}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set in deploy/.env}
+    volumes:
+      - hera-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  # One-shot schema migration runner — same image as api, exits 0 at head.
+  # A separate service (not `hera-bench migrate && uvicorn` in api's command)
+  # so a failing or slow migration shows up in `up -d --wait` as an explicit
+  # `migrate exited (1)` instead of an api container that is merely
+  # "unhealthy" with the real error buried in its logs.
+  migrate:
+    <<: *prod-common
+    image: ${HERA_API_IMAGE:?set image}@sha256:${HERA_API_DIGEST:?pin api digest}
+    hostname: hera-migrate
+    networks:
+      default:
+        aliases: [hera-migrate]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      HERA_IN_CONTAINER: "1"
+      HERA_ENV: prod
+      HERA_SECRET_KEY: ${HERA_SECRET_KEY:?set in deploy/.env}
+      HERA_MIGRATE_DATABASE_URL: postgresql+asyncpg://hera_migrate:${HERA_DB_MIGRATE_PASSWORD:?set in deploy/.env}@hera-db:5432/${POSTGRES_DB:-hera}
+    command: ["hera-bench", "migrate"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 768M
+
+  api:
+    <<: *prod-common
+    image: ${HERA_API_IMAGE:?set image}@sha256:${HERA_API_DIGEST:?pin api digest}
+    hostname: hera-api
+    networks:
+      default:
+        aliases: [hera-api]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment: *api-env
+    volumes:
+      - hera-backups:/backups
+      # The api streams attachments here as they upload. The worker does not
+      # mount it yet because it writes no files — the day it does (a generated
+      # PDF), it needs this same path and the same HERA_FILES_DIR.
+      - hera-files:/var/lib/hera/files
+    command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/health/live', headers={'Host':'127.0.0.1'}), timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # A cold page cache on a small VM can make the app import take 20s+.
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 768M
+
+  worker:
+    <<: *prod-common
+    image: ${HERA_API_IMAGE:?set image}@sha256:${HERA_API_DIGEST:?pin api digest}
+    hostname: hera-worker
+    networks:
+      default:
+        aliases: [hera-worker]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *api-env
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'from app.worker import tasks' && kill -0 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+
+  backup:
+    <<: *prod-common
+    image: ${HERA_API_IMAGE:?set image}@sha256:${HERA_API_DIGEST:?pin api digest}
+    hostname: hera-backup
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *api-env
+      HERA_BACKUP_RETENTION_DAYS: ${HERA_BACKUP_RETENTION_DAYS:-14}
+      HERA_BACKUP_INTERVAL_SECONDS: ${HERA_BACKUP_INTERVAL_SECONDS:-86400}
+      HERA_BACKUP_S3_URI: ${HERA_BACKUP_S3_URI:-}
+      HERA_BACKUP_S3_ENDPOINT_URL: ${HERA_BACKUP_S3_ENDPOINT_URL:-}
+      HERA_BACKUP_S3_REGION: ${HERA_BACKUP_S3_REGION:-us-east-1}
+      HERA_BACKUP_S3_ACCESS_KEY_ID: ${HERA_BACKUP_S3_ACCESS_KEY_ID:-}
+      HERA_BACKUP_S3_SECRET_ACCESS_KEY: ${HERA_BACKUP_S3_SECRET_ACCESS_KEY:-}
+    volumes:
+      - hera-backups:/backups
+    command: ["hera-bench", "backup-loop"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  web:
+    <<: *prod-common
+    image: ${HERA_WEB_IMAGE:?set image}@sha256:${HERA_WEB_DIGEST:?pin web digest}
+    hostname: hera-web
+    networks:
+      default:
+        aliases: [hera-web]
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["npm", "run", "preview", "--", "--host", "0.0.0.0", "--port", "5173"]
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5173/').then(r=>{if(!r.ok) process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  proxy:
+    <<: *prod-common
+    image: caddy:2-alpine@sha256:${HERA_CADDY_DIGEST:?pin caddy digest}
+    hostname: hera-proxy
+    networks:
+      default:
+        aliases: [hera-proxy]
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      HERA_DOMAIN: ${HERA_DOMAIN:?set in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?set an address for ACME expiry notices}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - hera-caddy-data:/data
+      - hera-caddy-config:/config
+    healthcheck:
+      test: ["CMD-SHELL", "caddy validate --config /etc/caddy/Caddyfile >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+volumes:
+  hera-db-data:
+  hera-redis-data:
+  hera-backups:
+  hera-files:
+  hera-caddy-data:
+  hera-caddy-config:

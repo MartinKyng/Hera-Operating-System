@@ -1,0 +1,28 @@
+# Hera production edge (Phase 9): Caddy obtains and renews HTTPS certs.
+# HERA_DOMAIN must be a public DNS name pointing at this VM. ACME_EMAIL is
+# required so the CA can contact the operator about certificate expiry.
+{
+	admin off
+	email {$ACME_EMAIL}
+}
+
+{$HERA_DOMAIN} {
+	encode zstd gzip
+
+	@API path /api/*
+	@HEALTH path /health/*
+	@METRICS path /metrics
+
+	handle @API {
+		reverse_proxy hera-api:8000
+	}
+	handle @HEALTH {
+		reverse_proxy hera-api:8000
+	}
+	handle @METRICS {
+		reverse_proxy hera-api:8000
+	}
+	handle {
+		reverse_proxy hera-web:5173
+	}
+}
