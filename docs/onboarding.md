@@ -50,6 +50,20 @@ boot of the data volume: `hera_app` (the application), `hera_migrate`
 existing volume will lock the site out — which is why `install.sh` refuses to
 rewrite an existing `.env` without `--force`.
 
+## When it does not come up
+
+`install.sh --up` checks that the proxy's host ports (80/443 by default) are
+free **before** pulling images. If something else holds one — nginx, apache, a
+second stack — it says which container or tells you the `ss` command to find
+the host process, and suggests `--http-port`/`--https-port`. Nothing has been
+started and no volume has been touched.
+
+If `up -d --wait` still fails, it prints a state table for every service, the
+logs of the ones implicated, and the cause: a failed migration (api and worker
+wait on it), a host port conflict (**your data is fine — `down -v` is not the
+fix**), an image the registry refused (`docker login ghcr.io`, or re-pin), or a
+container that never turned healthy in time (read the logs, re-run `--up`).
+
 ## Useful flags
 
 | Flag | Effect |
@@ -58,7 +72,8 @@ rewrite an existing `.env` without `--force`.
 | `--domain HOST` | required in prod; derives CORS, trusted hosts and the public URL |
 | `--pin vX.Y.Z` | pin every image by digest from that release's `images.env` |
 | `--channel stable\|beta` | pin whatever the rolling tag resolves to (needs Docker) |
-| `--http-port N` | publish the proxy on a different host port |
+| `--http-port N` | publish the proxy on a different host port (dev: 8080, prod: 80) |
+| `--https-port N` | prod only: the TLS port (default 443) |
 | `--bundle DIR` | write a transferable deploy directory |
 | `--force` | regenerate an existing `.env` (breaks issued JWTs) |
 | `--up` | bring the stack up and wait for health |

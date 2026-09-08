@@ -265,9 +265,14 @@ services:
     environment:
       HERA_DOMAIN: ${HERA_DOMAIN:?set in deploy/.env}
       ACME_EMAIL: ${ACME_EMAIL:?set an address for ACME expiry notices}
+    # Host ports default to 80/443 — Caddy's automatic HTTPS answers the ACME
+    # HTTP-01 challenge on 80 — but they are overridable for a VM where
+    # something else (nginx, a second stack) already holds them. install.sh
+    # writes both into deploy/.env; it refuses to start with a conflict rather
+    # than discovering it after the image pull.
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HERA_HTTP_PORT:-80}:80"
+      - "${HERA_HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
       - hera-caddy-data:/data
