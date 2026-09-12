@@ -9,6 +9,7 @@
 #   ./deploy/install.sh --env prod --domain books.example.com --pin vX.Y.Z-beta.N  # a beta
 #   ./deploy/install.sh --env prod --domain books.example.com --channel beta       # rolling tag, pinned
 #   ./deploy/install.sh --bundle /tmp/hera-vm     # write a transferable deploy bundle
+#   ./deploy/install.sh --env dev --env-file deploy/.env.dev --up   # per-env file (./hera manages these)
 #   ./deploy/install.sh --env prod --domain books.example.com --http-port 8080 --https-port 8443 --up
 #                                                # move the proxy off host 80/443 when
 #                                                # something else already holds them
@@ -114,6 +115,7 @@ ACME_EMAIL=""
 PIN=""
 CHANNEL=""
 BUNDLE_DIR=""
+ENV_FILE_OVERRIDE=""
 FORCE=0
 UP=0
 INSTALL_DIR="${HERA_INSTALL_DIR:-./hera-os}"
@@ -129,6 +131,7 @@ while [ $# -gt 0 ]; do
     --pin) PIN="${2:?}"; shift 2 ;;
     --channel) CHANNEL="${2:?}"; shift 2 ;;
     --bundle) BUNDLE_DIR="${2:?}"; shift 2 ;;
+    --env-file) ENV_FILE_OVERRIDE="${2:?}"; shift 2 ;;
     --dir) INSTALL_DIR="${2:?}"; shift 2 ;;
     --up) UP=1; shift ;;
     --force) FORCE=1; shift ;;
@@ -193,7 +196,10 @@ else
   REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
 
-TARGET="${SCRIPT_DIR}/.env"
+# --env-file names a per-environment file instead of the default deploy/.env
+# (./hera manages deploy/.env.dev / deploy/.env.prod this way). A relative
+# path resolves from the directory the script is invoked in.
+TARGET="${ENV_FILE_OVERRIDE:-${SCRIPT_DIR}/.env}"
 TEMPLATE="${REPO_ROOT}/.env.example"
 [ -f "${TEMPLATE}" ] || TEMPLATE="${SCRIPT_DIR}/env.example"
 [ -f "${TEMPLATE}" ] || die "template not found (expected .env.example near this script)"
@@ -434,13 +440,15 @@ else
 fi
 
 if [ "${UP}" = "0" ]; then
+  COMPOSE_HINT="docker compose -f ${COMPOSE_FILE}"
+  [ -n "${ENV_FILE_OVERRIDE}" ] && COMPOSE_HINT="docker compose --env-file ${TARGET} -f ${COMPOSE_FILE}"
   if [ "${ENV_MODE}" = "prod" ]; then
     echo "next (on the VM, DNS for ${DOMAIN} pointing at it, ${HOST_HTTP_PORT}/${HOST_HTTPS_PORT} open):"
-    echo "  docker compose -f ${COMPOSE_FILE} pull"
-    echo "  docker compose -f ${COMPOSE_FILE} up -d --wait"
+    echo "  ${COMPOSE_HINT} pull"
+    echo "  ${COMPOSE_HINT} up -d --wait"
   else
     echo "next (trial on this machine):"
-    echo "  docker compose -f ${COMPOSE_FILE} up -d --wait"
+    echo "  ${COMPOSE_HINT} up -d --wait"
   fi
   echo "  then open ${SITE_URL} — a fresh site opens the /setup wizard:"
   echo "  Administrator, company, currency, timezone (MFA enrolment follows in prod)."
@@ -729,6 +737,7 @@ else
   SELF_INVOCATION="${SCRIPT_DIR}/install.sh"
 fi
 ENV_ARGS="--env ${ENV_MODE}${DOMAIN:+ --domain ${DOMAIN}}"
+if [ -n "${ENV_FILE_OVERRIDE}" ]; then ENV_ARGS="${ENV_ARGS} --env-file ${TARGET}"; fi
 if [ "${ENV_MODE}" = "prod" ]; then
   PORT_FLAG_HINT=" --http-port <free> --https-port <free>"
 else
@@ -739,7 +748,11 @@ fi
 if [ "${UP}" = "1" ]; then
   need_bin docker "--up needs Docker Engine with the Compose plugin (ADR-005)"
   docker compose version >/dev/null 2>&1 || die "--up needs the Docker Compose plugin (ADR-005)"
-  COMPOSE=(docker compose -f "${COMPOSE_FILE}")
+  if [ -n "${ENV_FILE_OVERRIDE}" ]; then
+    COMPOSE=(docker compose --env-file "${TARGET}" -f "${COMPOSE_FILE}")
+  else
+    COMPOSE=(docker compose -f "${COMPOSE_FILE}")
+  fi
 
   preflight_host_ports
 
