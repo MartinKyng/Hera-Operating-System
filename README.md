@@ -82,8 +82,8 @@ curl -fsSL https://github.com/MartinKyng/Hera-Operating-System/releases/download
 pins whatever the rolling tag currently resolves to. Digests are the safe
 reference; tags are convenience.
 
-Images are published to `ghcr.io/martinkyng/hera-os-api` and
-`ghcr.io/martinkyng/hera-os-web`, and are publicly pullable without
+Images are published to Docker Hub at `docker.io/kyngroyalty/hera-os`, using
+separate `api-*` and `web-*` tags, and are publicly pullable without
 authentication.
 
 ### Upgrading

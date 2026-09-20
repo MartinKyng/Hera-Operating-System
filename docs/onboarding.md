@@ -61,7 +61,7 @@ started and no volume has been touched.
 If `up -d --wait` still fails, it prints a state table for every service, the
 logs of the ones implicated, and the cause: a failed migration (api and worker
 wait on it), a host port conflict (**your data is fine — `down -v` is not the
-fix**), an image the registry refused (`docker login ghcr.io`, or re-pin), or a
+fix**), an image the registry refused (`docker login docker.io`, or re-pin), or a
 container that never turned healthy in time (read the logs, re-run `--up`).
 
 ## Useful flags

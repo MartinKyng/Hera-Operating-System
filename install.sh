@@ -19,8 +19,7 @@
 #     | bash -s -- --env prod --domain books.example.com --acme-email ops@example.com --up
 #
 # What it does: creates deploy/.env from .env.example with every secret
-# machine-generated (openssl rand), the image registry set to GHCR
-# (decision 2026-08-30: GHCR over Docker Hub), and prod allowlists derived
+# machine-generated (openssl rand), images on Docker Hub, and prod allowlists derived
 # from --domain. Image digests come from a release's images.env (--pin) or
 # from the pulled rolling channel tag (--channel; RepoDigests). Run outside a
 # checkout, it fetches the deploy bundle (prod compose, Caddyfile, Postgres
@@ -53,12 +52,11 @@ set -euo pipefail
 #   ${RAW}/deploy/docker-compose.prod.yml   the standalone bundle (below)
 #   ${RAW}/.env.example                     the env template
 #   github.com/${REPO}/releases/download/<tag>/images.env   the --pin manifest
-# The images themselves are ghcr.io/martinkyng/hera-os-{api,web}; GHCR packages
-# default to PRIVATE, so patches/ghcr-public-visibility.patch flips them public
-# after each release. Override for a fork or mirror with HERA_REPO=you/repo.
+# Images live in the public Docker Hub repository; tags distinguish API/web.
+REPO=you/repo.
 REPO="${HERA_REPO:-MartinKyng/Hera-Operating-System}"
-API_IMAGE="ghcr.io/martinkyng/hera-os-api"
-WEB_IMAGE="ghcr.io/martinkyng/hera-os-web"
+API_IMAGE="docker.io/kyngroyalty/hera-os"
+WEB_IMAGE="docker.io/kyngroyalty/hera-os"
 POSTGRES_TAG="postgres:16-alpine"
 REDIS_TAG="redis:7-alpine"
 CADDY_TAG="caddy:2-alpine"
@@ -248,6 +246,9 @@ if [ "${WRITE_ENV}" = "1" ] && [ -n "${PIN}" ]; then
   digest_of() {
     printf '%s\n' "${MANIFEST}" | sed -n "s/^$1=sha256://p; s/^$1=//p" | head -n1
   }
+  API_IMAGE="$(digest_of HERA_API_IMAGE)"
+  WEB_IMAGE="$(digest_of HERA_WEB_IMAGE)"
+  [ -n "$API_IMAGE" ] && [ -n "$WEB_IMAGE" ] || die "manifest is missing image repositories"
   API_DIGEST="$(digest_of HERA_API_DIGEST)"
   WEB_DIGEST="$(digest_of HERA_WEB_DIGEST)"
   PG_DIGEST="$(digest_of HERA_POSTGRES_DIGEST)"
@@ -270,9 +271,9 @@ if [ "${WRITE_ENV}" = "1" ] && [ -n "${CHANNEL}" ]; then
     docker pull --quiet "$1" >/dev/null 2>&1 || return 1
     docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null | sed 's/^.*@sha256://'
   }
-  echo "pulling ${API_IMAGE}:${CHANNEL} (and friends) …"
-  API_DIGEST="$(pulled_digest "${API_IMAGE}:${CHANNEL}")" || die "cannot pull ${API_IMAGE}:${CHANNEL} — was a ${CHANNEL} release published? (GitHub → Actions → release) If the GHCR package is private: docker login ghcr.io"
-  WEB_DIGEST="$(pulled_digest "${WEB_IMAGE}:${CHANNEL}")" || die "cannot pull ${WEB_IMAGE}:${CHANNEL}"
+  echo "pulling ${API_IMAGE}:api-${CHANNEL} (and friends) …"
+  API_DIGEST="$(pulled_digest "${API_IMAGE}:api-${CHANNEL}")" || die "cannot pull ${API_IMAGE}:api-${CHANNEL} — was a ${CHANNEL} release published? (GitHub → Actions → release) If the Docker Hub repository is private: docker login docker.io"
+  WEB_DIGEST="$(pulled_digest "${WEB_IMAGE}:web-${CHANNEL}")" || die "cannot pull ${WEB_IMAGE}:web-${CHANNEL}"
   PG_DIGEST="$(pulled_digest "${POSTGRES_TAG}")" || die "cannot pull ${POSTGRES_TAG}"
   RD_DIGEST="$(pulled_digest "${REDIS_TAG}")" || die "cannot pull ${REDIS_TAG}"
   CD_DIGEST="$(pulled_digest "${CADDY_TAG}")" || die "cannot pull ${CADDY_TAG}"
@@ -330,7 +331,7 @@ if [ "${WRITE_ENV}" = "1" ]; then
 
 # ---------------------------------------------------------------------------
 # Managed by deploy/install.sh ($(date -u +%Y-%m-%dT%H:%M:%SZ)) — generated
-# secrets, GHCR images, derived allowlists. Do not duplicate these keys above.
+# secrets, digest-pinned images, derived allowlists. Do not duplicate these keys above.
 # ---------------------------------------------------------------------------
 
 # --- Core
@@ -379,7 +380,7 @@ HERA_DB_BACKUP_PASSWORD=${DB_BACKUP_PASSWORD}
 REDIS_PASSWORD=${REDIS_PASSWORD}
 REDIS_URL=redis://:${REDIS_PASSWORD}@hera-redis:6379/0
 
-# --- Images (GHCR — decision 2026-08-30; digests pinned by ${PIN:+--pin ${PIN}}${CHANNEL:+--channel ${CHANNEL}}${PIN:-${CHANNEL:-<none>}})
+# --- Images (Docker Hub by default; digests pinned by ${PIN:+--pin ${PIN}}${CHANNEL:+--channel ${CHANNEL}}${PIN:-${CHANNEL:-<none>}})
 HERA_API_IMAGE=${API_IMAGE}
 HERA_WEB_IMAGE=${WEB_IMAGE}
 HERA_API_DIGEST=${API_DIGEST}
@@ -395,7 +396,7 @@ EOF
 
   # --- report ------------------------------------------------------------------
   echo ""
-  echo "wrote ${TARGET}  (mode: ${ENV_MODE}, images: GHCR, pin: ${PIN:-${CHANNEL:-none}})"
+  echo "wrote ${TARGET}  (mode: ${ENV_MODE}, images: ${API_IMAGE}, pin: ${PIN:-${CHANNEL:-none}})"
   echo ""
   echo "  The first Administrator is created in the browser by the /setup wizard."
   echo "  (Scripted alternative, CI: hera-bench setup-site — uses HERA_ADMIN_EMAIL=${ADMIN_EMAIL}"
@@ -695,9 +696,8 @@ diagnose_failure() { # UP_LOG
       echo "    the migration error above and fix it, or restore a backup."
       ;;
     image)
-      echo "  - the pinned image is not reachable from this machine. GHCR packages"
-      echo "    default to private, so first: docker login ghcr.io (a token with"
-      echo "    Packages: read)."
+      echo "  - the pinned image is not reachable. Check Docker Hub availability and"
+      echo "    pull limits. For a private mirror, run: docker login docker.io"
       echo "  - then check the pin: https://github.com/${REPO}/releases"
       echo "    and re-run with a tag that exists (--pin vX.Y.Z)."
       ;;
@@ -761,8 +761,8 @@ if [ "${UP}" = "1" ]; then
     if ! "${COMPOSE[@]}" pull --quiet; then
       echo ""
       echo "!!! could not pull the pinned images (nothing was started)."
-      echo "  - GHCR packages default to private, so first: docker login ghcr.io"
-      echo "    (a token with Packages: read)."
+      echo "  - check Docker Hub availability and pull limits. For a private mirror:"
+      echo "    docker login docker.io"
       echo "  - then check the pin against https://github.com/${REPO}/releases and"
       echo "    re-run with a release that exists (--pin vX.Y.Z)."
       exit 1
