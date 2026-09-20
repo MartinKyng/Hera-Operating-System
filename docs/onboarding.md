@@ -1,22 +1,27 @@
 # Onboarding a Hera OS site
 
-Everything here happens through `install.sh` and the browser. There is no
-editor step and no hand-copied digest.
+Everything here happens through the downloaded `hera` file and the browser.
+There is no application source checkout or hand-copied digest.
 
 ## 1. Install
 
+Download the CLI once, then run the single deployment command:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MartinKyng/Hera-Operating-System/main/install.sh \
-  | bash -s -- --env prod --domain books.example.com --acme-email ops@example.com --pin v0.1.0 --up
+curl -fsSLo hera https://raw.githubusercontent.com/MartinKyng/Hera-Operating-System/main/hera
+bash hera prod up --domain books.example.com --channel stable --acme-email ops@example.com
 ```
 
-Before you run it: DNS for `books.example.com` must point at the machine, and
-ports 80 and 443 must be open. Caddy obtains the TLS certificate on first boot.
+The host needs Linux, Bash, Git, Docker Engine/Compose v2, curl and OpenSSL.
+DNS must point to it and ports 80/443 must be open for Caddy HTTPS. The CLI
+clones only the public distribution, pulls only Docker Hub images, and writes
+`deploy/.env.prod` once with generated secrets. Re-running `bash hera prod up`
+keeps that file and the existing image pins. Back it up securely; never use
+`--force` or `--fresh` for upgrades. Use `bash hera prod update --channel stable`
+(or an actual published `--pin vX.Y.Z`) after taking a verified backup.
 
-The script writes `deploy/.env` **once**. Secrets are generated with a CSPRNG
-and are never printed twice — keep a copy of the file. Re-running without
-`--force` refuses to overwrite it; with `--up` it keeps the existing file and
-just brings the stack up.
+See [the README](../README.md) for saved paths, versioned bundles and migration
+of legacy installations without changing project names or secrets.
 
 ## 2. Complete the `/setup` wizard
 

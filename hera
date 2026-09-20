@@ -1,0 +1,1405 @@
+#!/usr/bin/env bash
+# hera — the one Hera command. One command per environment, one file to edit.
+#
+#   ./hera dev up                  # localhost trial: build, start, open the /setup wizard
+#   ./hera prod up --domain ...    # production: pinned images, HTTPS, same wizard
+#   ./hera test                    # CI-equivalent tests in Compose (fresh database, like CI)
+#   ./hera seed dev                # demo data for dev (full playground site)
+#   ./hera seed prod --coa         # starter chart of accounts for prod
+#   ./hera logs dev api -f         # follow the API logs on dev
+#   ./hera apps dev enable crm     # install + enable an optional app
+#   ./hera backup prod             # immediate pg_dump of production
+#
+# Everything here shells out to Docker Compose and `hera-bench` inside the API
+# container — there is still no host install (ADR-005). The per-environment
+# config files this manages (deploy/.env.dev, deploy/.env.prod,
+# deploy/.env.test) are the things you edit; the CONFIG block below is the
+# only behaviour worth editing in this file. Full reference:
+# docs/deployment.md
+set -euo pipefail
+
+# ===========================================================================
+# CONFIG — the editable defaults. Every value can also be overridden with an
+# environment variable (e.g. HERA_DEV_ENV_FILE=/srv/hera/dev.env ./hera dev up).
+# Relative env-file paths resolve from the repository root, wherever you run
+# this script from.
+# ===========================================================================
+HERA_DEV_ENV_FILE="${HERA_DEV_ENV_FILE:-deploy/.env.dev}"
+HERA_PROD_ENV_FILE="${HERA_PROD_ENV_FILE:-deploy/.env.prod}"
+HERA_TEST_ENV_FILE="${HERA_TEST_ENV_FILE:-deploy/.env.test}"
+HERA_LEGACY_ENV_FILE="${HERA_LEGACY_ENV_FILE:-deploy/.env}"
+HERA_DEV_PROJECT="${HERA_DEV_PROJECT:-hera}"
+HERA_TEST_PROJECT="${HERA_TEST_PROJECT:-hera-test}"
+HERA_PROD_PROJECT="${HERA_PROD_PROJECT:-hera-prod}"
+HERA_DEV_PORT="${HERA_DEV_PORT:-8080}"
+HERA_TEST_PORT="${HERA_TEST_PORT:-8081}"
+# ===========================================================================
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SELF_DIR"
+DEPLOY_DIR="$REPO_ROOT/deploy"
+INSTALL_SH="$DEPLOY_DIR/install.sh"
+ENV_EXAMPLE="$REPO_ROOT/.env.example"
+VERSION_FILE="$REPO_ROOT/VERSION"
+COMPOSE_BASE="$DEPLOY_DIR/docker-compose.yml"
+COMPOSE_DEV_OVERLAY="$DEPLOY_DIR/docker-compose.dev.yml"
+COMPOSE_TEST_OVERLAY="$DEPLOY_DIR/docker-compose.test.yml"
+COMPOSE_PROD="$DEPLOY_DIR/docker-compose.prod.yml"
+
+# Third-party tags must match deploy/install.sh — keep the two in sync.
+# (First-party images are read back from the prod env file at update time, so
+# a fork that repointed them keeps working.)
+POSTGRES_TAG="postgres:16-alpine"
+REDIS_TAG="redis:7-alpine"
+CADDY_TAG="caddy:2-alpine"
+
+die() { echo "hera: error: $*" >&2; exit 1; }
+note() { echo "hera: $*" >&2; }
+need_bin() { command -v "$1" >/dev/null 2>&1 || die "$2"; }
+need_docker() {
+  need_bin docker "docker is required (ADR-005: containers only)"
+  docker compose version >/dev/null 2>&1 || die "the Docker Compose plugin is required (ADR-005)"
+}
+
+abspath() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *) printf '%s/%s' "$REPO_ROOT" "$1" ;;
+  esac
+}
+
+DEV_ENV_FILE="$(abspath "$HERA_DEV_ENV_FILE")"
+PROD_ENV_FILE="$(abspath "$HERA_PROD_ENV_FILE")"
+TEST_ENV_FILE="$(abspath "$HERA_TEST_ENV_FILE")"
+LEGACY_ENV_FILE="$(abspath "$HERA_LEGACY_ENV_FILE")"
+
+# env_value KEY FILE DEFAULT — the value KEY has in an env file (last wins).
+env_value() {
+  local value=""
+  [ -f "$2" ] && value="$(sed -n "s|^[[:space:]]*$1=\([^[:space:]#]*\).*|\1|p" "$2" | tail -n 1)"
+  printf '%s' "${value:-$3}"
+}
+
+need_arg() { # FLAG VALUE — every --flag value goes through here
+  [ -n "${2:-}" ] && [[ "$2" != -* ]] || die "$1 needs a value (see the --help for this command)"
+}
+
+valid_port() {
+  [[ "$2" =~ ^[0-9]{1,5}$ ]] && (( 10#$2 >= 1 && 10#$2 <= 65535 )) || die "$1 must be a port from 1 to 65535"
+}
+
+confirm() { # PROMPT — honour --yes, refuse without a terminal, else ask.
+  if [ "${ASSUME_YES:-0}" = "1" ]; then return 0; fi
+  if [ ! -t 0 ]; then die "$1 (pass --yes to confirm without a terminal)"; fi
+  local answer=""
+  read -r -p "hera: $1 [y/N] " answer
+  [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted."
+}
+
+# --- environment files ------------------------------------------------------
+# Each environment owns one editable file. A legacy deploy/.env (written by an
+# older install.sh) is honoured when the per-environment file does not exist
+# yet, so existing checkouts keep working with a visible note.
+
+target_env_file() { # dev|prod|test -> the file that environment owns
+  case "$1" in
+    dev) printf '%s' "$DEV_ENV_FILE" ;;
+    prod) printf '%s' "$PROD_ENV_FILE" ;;
+    test) printf '%s' "$TEST_ENV_FILE" ;;
+    *) die "unknown environment: $1 (want dev, prod or test)" ;;
+  esac
+}
+
+active_env_file() { # dev|prod|test -> the file in force ("" when none exists)
+  local owned
+  owned="$(target_env_file "$1")"
+  if [ -f "$owned" ]; then printf '%s' "$owned"; return 0; fi
+  if [ "$1" != "test" ] && [ -f "$LEGACY_ENV_FILE" ]; then
+    note "no $owned yet — using legacy $LEGACY_ENV_FILE (copy it to $owned to silence this)"
+    printf '%s' "$LEGACY_ENV_FILE"; return 0
+  fi
+  printf ''
+}
+
+EF="" # the env file in force for the current command (set by ensure_env_*)
+
+ensure_env_dev() { # [http-port] — generate .env.dev on first boot only
+  local port="${1:-$HERA_DEV_PORT}"
+  EF="$(active_env_file dev)"
+  [ -n "$EF" ] && return 0
+  need_bin openssl "openssl is required to generate secrets"
+  local args=(--env dev --env-file "$DEV_ENV_FILE")
+  [ -n "$port" ] && args+=(--http-port "$port")
+  [ -n "${ADMIN_EMAIL:-}" ] && args+=(--admin-email "$ADMIN_EMAIL")
+  mkdir -p "$(dirname "$DEV_ENV_FILE")"
+  note "first boot: generating $DEV_ENV_FILE"
+  "$INSTALL_SH" "${args[@]}"
+  EF="$DEV_ENV_FILE"
+}
+
+ensure_env_prod() { # requires PROD_* globals when the file does not exist yet
+  EF="$(active_env_file prod)"
+  if [ -n "$EF" ]; then
+    [ -z "${PROD_DOMAIN:-}" ] || note "$EF exists — --domain does not change saved domain/URL/allowlists"
+    if [ -n "${PROD_PIN:-}${PROD_CHANNEL:-}" ]; then
+      note "$EF exists — ignoring --pin/--channel (change digests with: ./hera prod update)"
+    fi
+    return 0
+  fi
+  [ -n "${PROD_DOMAIN:-}" ] || die "the first prod boot needs --domain (e.g. ./hera prod up --domain books.example.com)"
+  need_bin openssl "openssl is required to generate secrets"
+  local args=(--env prod --domain "$PROD_DOMAIN" --env-file "$PROD_ENV_FILE")
+  [ -n "${PROD_PIN:-}" ] && args+=(--pin "$PROD_PIN")
+  [ -n "${PROD_CHANNEL:-}" ] && args+=(--channel "$PROD_CHANNEL")
+  [ -n "${PROD_ACME_EMAIL:-}" ] && args+=(--acme-email "$PROD_ACME_EMAIL")
+  [ -n "${PROD_HTTP_PORT:-}" ] && args+=(--http-port "$PROD_HTTP_PORT")
+  [ -n "${PROD_HTTPS_PORT:-}" ] && args+=(--https-port "$PROD_HTTPS_PORT")
+  [ -n "${ADMIN_EMAIL:-}" ] && args+=(--admin-email "$ADMIN_EMAIL")
+  mkdir -p "$(dirname "$PROD_ENV_FILE")"
+  note "first boot: generating $PROD_ENV_FILE"
+  "$INSTALL_SH" "${args[@]}"
+  EF="$PROD_ENV_FILE"
+}
+
+ensure_env_test() { # test-only values, never real secrets (mirrors ci.yml)
+  EF="$(active_env_file test)"
+  [ -n "$EF" ] && return 0
+  [ -f "$ENV_EXAMPLE" ] || die "template not found: $ENV_EXAMPLE"
+  note "first run: generating $TEST_ENV_FILE (test-only values, never real secrets)"
+  local tmp
+  mkdir -p "$(dirname "$TEST_ENV_FILE")"
+  tmp="$(mktemp "${TEST_ENV_FILE}.tmp.XXXXXX")"
+  sed -E \
+    -e 's/^HERA_SECRET_KEY=.*/HERA_SECRET_KEY=test-only-not-a-secret-0123456789abcdef/' \
+    -e 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=test-postgres/' \
+    -e 's/^HERA_DB_APP_PASSWORD=.*/HERA_DB_APP_PASSWORD=test-app/' \
+    -e 's/^HERA_DB_MIGRATE_PASSWORD=.*/HERA_DB_MIGRATE_PASSWORD=test-migrate/' \
+    -e 's/^HERA_DB_BACKUP_PASSWORD=.*/HERA_DB_BACKUP_PASSWORD=test-backup/' \
+    -e 's/^REDIS_PASSWORD=.*/REDIS_PASSWORD=test-redis/' \
+    -e 's#^REDIS_URL=.*#REDIS_URL=redis://:test-redis@hera-redis:6379/0#' \
+    -e 's/^HERA_ADMIN_EMAIL=.*/HERA_ADMIN_EMAIL=admin@local.test/' \
+    -e 's/^HERA_ADMIN_PASSWORD=.*/HERA_ADMIN_PASSWORD=AdminPass1234/' \
+    -e 's/^#HERA_PAYMENTS_STUB=0/HERA_PAYMENTS_STUB=1/' \
+    -e "s/^HERA_HTTP_PORT=.*/HERA_HTTP_PORT=$HERA_TEST_PORT/" \
+    "$ENV_EXAMPLE" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$TEST_ENV_FILE"
+  EF="$TEST_ENV_FILE"
+}
+
+# --- compose ----------------------------------------------------------------
+# COMPOSE is a global array so paths with spaces survive: "${COMPOSE[@]}" ...
+
+COMPOSE=()
+
+compose_dev() {
+  COMPOSE=(docker compose --env-file "$EF" -f "$COMPOSE_BASE")
+  if [ "${HMR:-0}" = "1" ]; then COMPOSE+=(-f "$COMPOSE_DEV_OVERLAY"); fi
+  COMPOSE+=(-p "$HERA_DEV_PROJECT")
+}
+
+compose_test() {
+  [ "$HERA_TEST_PROJECT" != "$HERA_DEV_PROJECT" ] && [ "$HERA_TEST_PROJECT" != "$HERA_PROD_PROJECT" ] || die "test project must differ from dev and prod (tests delete volumes)"
+  [ "$(env_value HERA_ENV "$EF" dev)" != "prod" ] || die "test refuses a production env file"
+
+  COMPOSE=(docker compose --env-file "$EF" -f "$COMPOSE_BASE" -f "$COMPOSE_TEST_OVERLAY" -p "$HERA_TEST_PROJECT")
+}
+
+compose_prod() {
+  validate_prod_images
+  COMPOSE=(docker compose --env-file "$EF" -f "$COMPOSE_PROD" -p "$HERA_PROD_PROJECT")
+}
+
+compose_for() { # dev|prod|test — build COMPOSE for an environment
+  case "$1" in
+    dev) compose_dev ;;
+    test) compose_test ;;
+    prod) compose_prod ;;
+    *) die "unknown environment: $1 (want dev, prod or test)" ;;
+  esac
+}
+
+require_up() { # ENV — the api container must exist and run
+  if ! "${COMPOSE[@]}" exec -T api true >/dev/null 2>&1; then
+    die "the $1 stack is not running — start it first: ./hera $1 up"
+  fi
+}
+
+bench() { # ENV hera-bench args... — run hera-bench inside the API container
+  local env="$1"; shift
+  require_up "$env"
+  "${COMPOSE[@]}" exec -T api hera-bench "$@"
+}
+
+# --- first-boot guards ------------------------------------------------------
+
+tcp_port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1; }
+
+preflight_port() { # PORT ENV — refuse before pulling when someone holds the port
+  local port="$1" env="$2" holders mine id rest foreign=""
+  tcp_port_busy "$port" || return 0
+  mine="$("${COMPOSE[@]}" ps -aq 2>/dev/null | tr '\n' ' ' || true)"
+  holders="$(docker ps --no-trunc --filter "publish=$port" --format '{{.ID}}|{{.Names}}' 2>/dev/null || true)"
+  if [ -n "$holders" ]; then
+    while IFS='|' read -r id rest; do
+      [ -n "${id:-}" ] || continue
+      case " $mine " in *" $id "*) continue ;; esac
+      foreign="yes"
+    done <<< "$holders"
+    if [ -z "$foreign" ]; then
+      note "host port $port is published by this stack's own proxy — it will be recreated"
+      return 0
+    fi
+  fi
+  echo "" >&2
+  echo "hera: error: host port $port is already in use — the proxy (Caddy) cannot bind it." >&2
+  echo "  Stop that listener and re-run, or move Hera onto a free port:" >&2
+  if [ "$env" = "prod" ]; then
+    echo "    ./hera prod up --http-port <free> --https-port <free>" >&2
+  else
+    echo "    ./hera $env up --port <free>" >&2
+  fi
+  echo "  Nothing was started and no volume was touched — this is a host port" >&2
+  echo "  conflict, not a database problem." >&2
+  exit 1
+}
+
+up_failed() { # ENV — compact post-mortem: states, then the implicated logs
+  local env="$1" service log_out
+  echo "" >&2
+  echo "hera: the $env stack did not come up healthy." >&2
+  echo "" >&2
+  "${COMPOSE[@]}" ps -a >&2 || true
+  echo "" >&2
+  echo "hera: last logs of the services involved:" >&2
+  for service in web migrate api worker db redis proxy; do
+    echo "---------------- $service ----------------" >&2
+    log_out="$("${COMPOSE[@]}" logs --tail 40 "$service" 2>/dev/null || true)"
+    if [ -n "$log_out" ]; then printf '%s\n' "$log_out" >&2; else echo "(no output)" >&2; fi
+  done
+  echo "" >&2
+  echo "hints:" >&2
+  echo "  - migrate EXITED non-zero: read its error above. Only a never-used site" >&2
+  echo "    may be wiped (./hera $env down --volumes); a site WITH data must be" >&2
+  echo "    fixed or restored, never wiped." >&2
+  echo "  - api/worker ImportError after a git pull: the venv is baked into the" >&2
+  echo "    image — rebuild it (./hera dev build api worker)." >&2
+  echo "  - web restarting after a git pull: read its npm/Vite error above." >&2
+  echo "    The dev/test web startup checks package manifests against node_modules;" >&2
+  echo "    if npm ci fails, fix the registry/network/disk error, then retry up." >&2
+  echo "    Never delete database volumes to repair frontend dependencies." >&2
+  echo "  - full state: ./hera $env ps -a · follow one: ./hera logs $env <service>" >&2
+  echo "  - every cause and remedy: docs/deployment.md (troubleshooting)." >&2
+}
+
+site_url_for() { # ENV — the desk URL, read back from the env file in force
+  local env="$1" domain http https def
+  if [ "$env" = "prod" ]; then
+    domain="$(env_value HERA_DOMAIN "$EF" "")"
+    http="${one_shot_port:-$(env_value HERA_HTTP_PORT "$EF" 80)}"
+    https="${one_shot_https:-$(env_value HERA_HTTPS_PORT "$EF" 443)}"
+    if [ "$http" = "80" ] && [ "$https" = "443" ]; then
+      printf 'https://%s' "$domain"
+    else
+      printf 'http://%s:%s (custom ports: put your own TLS proxy in front, or use DNS-01)' "$domain" "$http"
+    fi
+  else
+    def="$HERA_DEV_PORT"
+    [ "$env" = "test" ] && def="$HERA_TEST_PORT"
+    http="${one_shot_port:-$(env_value HERA_HTTP_PORT "$EF" "$def")}"
+    printf 'http://localhost:%s' "$http"
+  fi
+}
+
+print_next_steps() { # ENV — wizard URL, setup status, seed hint
+  local env="$1" url status=""
+  url="$(site_url_for "$env")"
+  echo ""
+  echo "Hera ($env) is up. Open the desk to finish setup:"
+  echo "  -> $url"
+  echo "     A fresh site opens the /setup wizard: create the Administrator, name the"
+  echo "     company, pick currency + timezone — then sign in."
+  if command -v curl >/dev/null 2>&1; then
+    status="$(curl -fsS "$url/api/v1/setup/status" 2>/dev/null || true)"
+    [ -n "$status" ] && echo "  -> setup status: $status"
+  fi
+  echo ""
+  if [ "$env" = "prod" ]; then
+    echo "seed data (after the wizard):  ./hera seed prod --coa"
+  else
+    echo "seed data (after the wizard):  ./hera seed $env   (full playground site)"
+  fi
+  echo "follow the logs:             ./hera logs $env"
+}
+
+# --- dev / prod lifecycle ---------------------------------------------------
+
+cmd_up() { # ENV [flags] — generate env on first boot, preflight, pull, up
+  local env="$1"; shift
+  local build=0 fresh=0 no_wait=0 no_pull=0 hmr=0 one_shot_port="" one_shot_https=""
+  HMR=0; ASSUME_YES=0; ADMIN_EMAIL=""
+  PROD_DOMAIN=""; PROD_PIN=""; PROD_CHANNEL=""; PROD_ACME_EMAIL=""
+  PROD_HTTP_PORT=""; PROD_HTTPS_PORT=""
+  local dev_port=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --build) build=1; shift ;;
+      --fresh) fresh=1; shift ;;
+      --hmr) hmr=1; shift ;;
+      --no-wait) no_wait=1; shift ;;
+      --no-pull) no_pull=1; shift ;;
+      --yes) ASSUME_YES=1; shift ;;
+      --port) need_arg "$1" "${2:-}"; dev_port="$2"; shift 2 ;;
+      --domain) need_arg "$1" "${2:-}"; PROD_DOMAIN="$2"; shift 2 ;;
+      --pin) need_arg "$1" "${2:-}"; PROD_PIN="$2"; shift 2 ;;
+      --channel) need_arg "$1" "${2:-}"; PROD_CHANNEL="$2"; shift 2 ;;
+      --acme-email) need_arg "$1" "${2:-}"; PROD_ACME_EMAIL="$2"; shift 2 ;;
+      --http-port) need_arg "$1" "${2:-}"; PROD_HTTP_PORT="$2"; [ "$env" = "dev" ] && dev_port="$PROD_HTTP_PORT"; shift 2 ;;
+      --https-port) need_arg "$1" "${2:-}"; PROD_HTTPS_PORT="$2"; shift 2 ;;
+      --admin-email) need_arg "$1" "${2:-}"; ADMIN_EMAIL="$2"; shift 2 ;;
+      -h|--help) usage_up "$env"; exit 0 ;;
+      *) die "unknown flag for $env up: $1 (see ./hera $env up --help)" ;;
+    esac
+  done
+  [ "$env" = "prod" ] && [ "$hmr" = "1" ] && die "--hmr is a dev flag (prod serves the built desk)"
+  [ "$env" = "prod" ] && [ "$build" = "1" ] && die "prod uses pinned images, never local builds (upgrade with ./hera prod update)"
+  [ -z "$PROD_PIN" ] || valid_release_pin "$PROD_PIN"
+  [ -n "$PROD_PIN" ] && [ -n "$PROD_CHANNEL" ] && die "--pin and --channel are exclusive: a release manifest OR a rolling tag"
+  if [ -n "$PROD_CHANNEL" ] && [ "$PROD_CHANNEL" != "stable" ] && [ "$PROD_CHANNEL" != "beta" ]; then
+    die "--channel must be stable or beta"
+  fi
+  [ -z "$dev_port" ] || valid_port --port "$dev_port"
+  [ -z "$PROD_HTTP_PORT" ] || valid_port --http-port "$PROD_HTTP_PORT"
+  [ -z "$PROD_HTTPS_PORT" ] || valid_port --https-port "$PROD_HTTPS_PORT"
+  if [ "$env" = "dev" ] && [ -n "$PROD_DOMAIN$PROD_PIN$PROD_CHANNEL$PROD_ACME_EMAIL$PROD_HTTPS_PORT" ]; then
+    die "--domain, --pin, --channel, --acme-email and --https-port are prod flags"
+  fi
+  [ "$env" != "prod" ] || [ -z "$dev_port" ] || die "--port is a dev flag; use --http-port on prod"
+  need_docker
+  HMR="$hmr"
+
+  # First boot generates the env file (persisting the ports); later boots
+  # keep it, and --port/--http-port/--https-port apply one-shot.
+  local existed=1
+  if [ -z "$(active_env_file "$env" 2>/dev/null)" ]; then existed=0; fi
+  if [ "$env" = "prod" ]; then
+    ensure_env_prod
+  else
+    ensure_env_dev "$dev_port"
+  fi
+  if [ "$existed" = "1" ]; then
+    local req_http="$dev_port"
+    [ -n "$PROD_HTTP_PORT" ] && req_http="$PROD_HTTP_PORT"
+    if [ -n "$req_http" ]; then
+      one_shot_port="$req_http"
+      note "one-shot port $one_shot_port (not saved; persist it as HERA_HTTP_PORT in $EF)"
+    fi
+    if [ -n "$PROD_HTTPS_PORT" ]; then
+      one_shot_https="$PROD_HTTPS_PORT"
+      note "one-shot https port $one_shot_https (not saved; persist it as HERA_HTTPS_PORT in $EF)"
+    fi
+  fi
+  [ "$env" != prod ] || validate_prod_images
+  compose_for "$env"
+
+  if [ "$fresh" = "1" ]; then
+    confirm "wipe the $env site (containers AND volumes — all data deleted)?"
+    "${COMPOSE[@]}" down -v --remove-orphans
+  fi
+  if [ "$build" = "1" ]; then
+    note "rebuilding images …"
+    "${COMPOSE[@]}" build
+  fi
+
+  local up_args=(up -d)
+  [ "$no_wait" = "0" ] && up_args+=(--wait)
+
+  if [ "$env" = "prod" ]; then
+    preflight_port "${one_shot_port:-$(env_value HERA_HTTP_PORT "$EF" 80)}" prod
+    preflight_port "${one_shot_https:-$(env_value HERA_HTTPS_PORT "$EF" 443)}" prod
+    if [ "$no_pull" = "0" ]; then
+      note "pulling pinned images …"
+      "${COMPOSE[@]}" pull --quiet || die "could not pull the pinned images (docker login docker.io, or re-pin a release that exists — see ./hera prod update --help)"
+    fi
+  else
+    if [ -n "$one_shot_port" ]; then preflight_port "$one_shot_port" "$env";
+    else preflight_port "$(env_value HERA_HTTP_PORT "$EF" "$HERA_DEV_PORT")" "$env"; fi
+    note "starting the $env stack (the first build can take a few minutes) …"
+  fi
+
+  set +e
+  if [ -n "$one_shot_port" ] && [ -n "$one_shot_https" ]; then
+    HERA_HTTP_PORT="$one_shot_port" HERA_HTTPS_PORT="$one_shot_https" "${COMPOSE[@]}" "${up_args[@]}"
+  elif [ -n "$one_shot_port" ]; then
+    HERA_HTTP_PORT="$one_shot_port" "${COMPOSE[@]}" "${up_args[@]}"
+  elif [ -n "$one_shot_https" ]; then
+    HERA_HTTPS_PORT="$one_shot_https" "${COMPOSE[@]}" "${up_args[@]}"
+  else
+    "${COMPOSE[@]}" "${up_args[@]}"
+  fi
+  local status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then up_failed "$env"; exit 1; fi
+  print_next_steps "$env"
+}
+
+cmd_down() { # ENV [--volumes] [--yes]
+  local env="$1"; shift
+  local volumes=0; ASSUME_YES=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --volumes|-v) volumes=1; shift ;;
+      --yes) ASSUME_YES=1; shift ;;
+      -h|--help) usage_down "$env"; exit 0 ;;
+      *) die "unknown flag for $env down: $1 (see ./hera $env down --help)" ;;
+    esac
+  done
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet — nothing to stop (run ./hera $env up first)"
+  compose_for "$env"
+  if [ "$volumes" = "1" ]; then
+    confirm "wipe the $env site (containers AND volumes — all data deleted)?"
+    "${COMPOSE[@]}" down -v --remove-orphans
+  else
+    "${COMPOSE[@]}" down --remove-orphans
+    note "$env stopped (data kept in its volumes)"
+  fi
+}
+
+cmd_restart() { # ENV [service...] — args pass through to compose restart
+  local env="$1"; shift
+  case "${1:-}" in -h|--help) usage_env "$env"; exit 0 ;; esac
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  "${COMPOSE[@]}" restart "$@"
+}
+
+cmd_ps() { # ENV [compose ps args...] — service names and -a pass through
+  local env="$1"; shift
+  case "${1:-}" in -h|--help) usage_env "$env"; exit 0 ;; esac
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  "${COMPOSE[@]}" ps "$@"
+}
+
+cmd_shell() { # ENV [service] [command...]
+  local env="$1"; shift
+  local service="api"
+  if [ $# -gt 0 ]; then
+    case "$1" in -h|--help) usage_env "$env"; exit 0 ;; -*) ;; *) service="$1"; shift ;; esac
+  fi
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  if [ $# -eq 0 ]; then
+    "${COMPOSE[@]}" exec "$service" sh
+  else
+    "${COMPOSE[@]}" exec -T "$service" sh -lc "$*"
+  fi
+}
+
+cmd_setup() { # ENV --company ... — scripted bootstrap (the wizard is the other door)
+  local env="$1"; shift
+  local company="" currency="NGN" admin_email="" timezone=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --company) need_arg "$1" "${2:-}"; company="$2"; shift 2 ;;
+      --currency) need_arg "$1" "${2:-}"; currency="$2"; shift 2 ;;
+      --admin-email) need_arg "$1" "${2:-}"; admin_email="$2"; shift 2 ;;
+      --timezone) need_arg "$1" "${2:-}"; timezone="$2"; shift 2 ;;
+      -h|--help) usage_setup "$env"; exit 0 ;;
+      *) die "unknown flag for $env setup: $1 (see ./hera $env setup --help)" ;;
+    esac
+  done
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  local args=(setup-site --currency "$currency")
+  [ -n "$company" ] && args+=(--company "$company")
+  [ -n "$admin_email" ] && args+=(--admin-email "$admin_email")
+  [ -n "$timezone" ] && args+=(--timezone "$timezone")
+  bench "$env" "${args[@]}"
+}
+
+cmd_doctor() { # ENV — health report from inside the stack
+  local env="$1"; shift
+  case "${1:-}" in -h|--help) usage_env "$env"; exit 0 ;; esac
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  bench "$env" doctor
+}
+
+cmd_build() { # dev only — rebuild after pulling commits that changed deps
+  local env="$1"; shift
+  [ "$env" = "dev" ] || die "$env uses pinned images, never local builds (prod upgrades with ./hera prod update)"
+  case "${1:-}" in -h|--help) usage_env dev; exit 0 ;; esac
+  need_docker
+  EF="$(active_env_file dev)"
+  [ -n "$EF" ] || die "no dev env file yet (run ./hera dev up first)"
+  compose_dev
+  "${COMPOSE[@]}" build "$@"
+  note "rebuilt — restart to run it: ./hera dev restart"
+}
+
+cmd_url() { # ENV — print the desk URL (no docker needed)
+  local env="$1"; shift
+  case "${1:-}" in -h|--help) usage_env "$env"; exit 0 ;; esac
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  site_url_for "$env"
+  echo ""
+}
+
+# --- prod update --------------------------------------------------------------
+# Upgrades change ONLY the five image digests (plus HERA_VERSION on --pin):
+# secrets are never regenerated, so --force is never involved.
+
+check_digest() {
+  echo "$2" | grep -qE '^[a-f0-9]{64}$' || die "$1 missing or not a sha256 hex digest ($3)"
+}
+
+set_digest() { # FILE KEY DIGEST — replace every occurrence (active or commented), or append
+  local file="$1" key="$2" digest="$3" tmp
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+  if grep -qE "^[[:space:]]*#?[[:space:]]*${key}=" "$file"; then
+    sed -E "s|^[[:space:]]*#?[[:space:]]*${key}=.*|${key}=${digest}|" "$file" > "$tmp"
+  else
+    { cat "$file"; printf '\n%s=%s\n' "$key" "$digest"; } > "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$file"
+}
+
+cmd_prod_update() { # --pin vX.Y.Z | --channel stable|beta
+  local pin="" channel=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pin) need_arg "$1" "${2:-}"; pin="$2"; shift 2 ;;
+      --channel) need_arg "$1" "${2:-}"; channel="$2"; shift 2 ;;
+      -h|--help) usage_prod_update; exit 0 ;;
+      *) die "unknown flag for prod update: $1 (see ./hera prod update --help)" ;;
+    esac
+  done
+  [ -z "$pin" ] || valid_release_pin "$pin"
+  [ -n "$pin" ] || [ -n "$channel" ] || die "prod update needs --pin vX.Y.Z or --channel stable|beta"
+  [ -n "$pin" ] && [ -n "$channel" ] && die "--pin and --channel are exclusive"
+  if [ -n "$channel" ] && [ "$channel" != "stable" ] && [ "$channel" != "beta" ]; then
+    die "--channel must be stable or beta"
+  fi
+  EF="$(active_env_file prod)"
+  [ -n "$EF" ] || die "no prod env file yet (run ./hera prod up first)"
+  local repo="${HERA_REPO:-MartinKyng/Hera-Operating-System}"
+  [ "$repo" = MartinKyng/Hera-Operating-System ] || die "production uses only the public release repository"
+  local override
+  for override in HERA_API_IMAGE HERA_WEB_IMAGE; do
+    [ -z "${!override+x}" ] || validate_hub_image "$override" "${!override}"
+  done
+  local api_image web_image api_digest="" web_digest="" pg_digest="" rd_digest="" cd_digest=""
+  api_image="$(env_value HERA_API_IMAGE "$EF" "docker.io/kyngroyalty/hera-os")"
+  web_image="$(env_value HERA_WEB_IMAGE "$EF" "docker.io/kyngroyalty/hera-os")"
+
+  if [ -n "$pin" ]; then
+    need_bin curl "--pin needs curl to fetch the release manifest"
+    local url="https://github.com/${repo}/releases/download/${pin}/images.env" manifest
+    note "fetching digest manifest $pin …"
+    manifest="$(curl -fsSL "$url")" || die "could not fetch $url (does the release exist?)"
+    digest_of() { printf '%s\n' "$manifest" | sed -n "s/^$1=sha256://p; s/^$1=//p" | head -n1; }
+    api_image="$(digest_of HERA_API_IMAGE)"
+    web_image="$(digest_of HERA_WEB_IMAGE)"
+    [ -n "$api_image" ] && [ -n "$web_image" ] || die "manifest is missing image repositories"
+    api_digest="$(digest_of HERA_API_DIGEST)"
+    web_digest="$(digest_of HERA_WEB_DIGEST)"
+    pg_digest="$(digest_of HERA_POSTGRES_DIGEST)"
+    rd_digest="$(digest_of HERA_REDIS_DIGEST)"
+    cd_digest="$(digest_of HERA_CADDY_DIGEST)"
+  else
+    api_image="docker.io/kyngroyalty/hera-os"
+    web_image="docker.io/kyngroyalty/hera-os"
+    need_docker
+    pulled_digest() {
+      docker pull --quiet "$1" >/dev/null 2>&1 || return 1
+      docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null | sed 's/^.*@sha256://'
+    }
+    note "pulling ${api_image}:api-${channel} (and friends) …"
+    api_digest="$(pulled_digest "${api_image}:api-${channel}")" || die "cannot pull ${api_image}:api-${channel} — was a $channel release published? (If the Docker Hub repository is private: docker login docker.io)"
+    web_digest="$(pulled_digest "${web_image}:web-${channel}")" || die "cannot pull ${web_image}:web-${channel}"
+    pg_digest="$(pulled_digest "$POSTGRES_TAG")" || die "cannot pull $POSTGRES_TAG"
+    rd_digest="$(pulled_digest "$REDIS_TAG")" || die "cannot pull $REDIS_TAG"
+    cd_digest="$(pulled_digest "$CADDY_TAG")" || die "cannot pull $CADDY_TAG"
+  fi
+  local pair
+  for pair in "HERA_API_DIGEST:${api_digest}" "HERA_WEB_DIGEST:${web_digest}" \
+              "HERA_POSTGRES_DIGEST:${pg_digest}" "HERA_REDIS_DIGEST:${rd_digest}" \
+              "HERA_CADDY_DIGEST:${cd_digest}"; do
+    check_digest "${pair%%:*}" "${pair#*:}" "for ${pin:-$channel}"
+  done
+
+  validate_hub_image HERA_API_IMAGE "$api_image"
+  validate_hub_image HERA_WEB_IMAGE "$web_image"
+  local backup="${EF}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp "$EF" "$backup"
+  note "backed up $EF → $backup"
+  set_digest "$EF" HERA_API_IMAGE "$api_image"
+  set_digest "$EF" HERA_WEB_IMAGE "$web_image"
+  set_digest "$EF" HERA_API_DIGEST "$api_digest"
+  set_digest "$EF" HERA_WEB_DIGEST "$web_digest"
+  set_digest "$EF" HERA_POSTGRES_DIGEST "$pg_digest"
+  set_digest "$EF" HERA_REDIS_DIGEST "$rd_digest"
+  set_digest "$EF" HERA_CADDY_DIGEST "$cd_digest"
+  if [ -n "$pin" ]; then
+    case "$pin" in
+      v*) set_digest "$EF" HERA_VERSION "${pin#v}" ;;
+    esac
+  fi
+  note "pinned ${pin:-$channel}: api ${api_digest:0:12}… web ${web_digest:0:12}… (secrets untouched)"
+
+  need_docker
+  compose_for prod
+  "${COMPOSE[@]}" pull --quiet || die "could not pull the pinned images"
+  set +e
+  "${COMPOSE[@]}" up -d --wait
+  local status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    up_failed prod
+    echo "the previous env file is intact at $backup" >&2
+    exit 1
+  fi
+  note "prod updated to ${pin:-$channel}. Volumes, secrets and the site survived."
+}
+
+# --- test ---------------------------------------------------------------------
+
+cmd_test() { # [--e2e] [--lint] [--build] [--keep] [--down] [pytest args...] | down|logs|ps
+  shift # drop "test"
+  case "${1:-run}" in
+    down)
+      shift; local volumes=0; ASSUME_YES=0
+      while [ $# -gt 0 ]; do
+        case "$1" in --volumes|-v) volumes=1; shift ;; --yes) ASSUME_YES=1; shift ;;
+          -h|--help) usage_test; exit 0 ;; *) die "unknown flag for test down: $1" ;; esac
+      done
+      need_docker
+      ensure_env_test
+      compose_for test
+      if [ "$volumes" = "1" ]; then
+        confirm "wipe the test project (containers AND volumes)?"
+        "${COMPOSE[@]}" down -v --remove-orphans
+      else
+        "${COMPOSE[@]}" down --remove-orphans
+      fi
+      return 0 ;;
+    logs) shift; cmd_logs test "$@"; return 0 ;;
+    ps) shift; cmd_ps test "$@"; return 0 ;;
+  esac
+  local e2e=0 lint=0 build=0 keep=0 down=0
+  local pytest_args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --e2e) e2e=1; shift ;;
+      --lint) lint=1; shift ;;
+      --build) build=1; shift ;;
+      --keep) keep=1; shift ;;
+      --down) down=1; shift ;;
+      -h|--help) usage_test; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do pytest_args+=("$1"); shift; done ;;
+      *) pytest_args+=("$1"); shift ;;
+    esac
+  done
+  need_docker
+  ensure_env_test
+  compose_for test
+  if [ "$down" = "1" ]; then
+    trap 'status=$?; "${COMPOSE[@]}" down -v --remove-orphans || status=1; exit "$status"' EXIT
+  fi
+  if [ "$keep" = "0" ]; then
+    note "starting from a clean slate (CI-faithful; pass --keep to reuse the test volume)"
+    "${COMPOSE[@]}" down -v --remove-orphans
+  fi
+  if [ "$build" = "1" ]; then
+    note "rebuilding the test image …"
+    "${COMPOSE[@]}" build api
+  fi
+  if [ "$lint" = "1" ]; then
+    note "lint + types (same image as runtime) …"
+    "${COMPOSE[@]}" run --rm --no-deps api sh -lc "ruff check . && ruff format --check . && mypy app hera_bench"
+  fi
+  note "pytest in Compose (Postgres + Redis) …"
+  if [ "${#pytest_args[@]}" -eq 0 ]; then
+    "${COMPOSE[@]}" run --rm api pytest
+  else
+    "${COMPOSE[@]}" run --rm api pytest "${pytest_args[@]}"
+  fi
+  if [ "$e2e" = "1" ]; then
+    note "bringing the test stack up for Playwright …"
+    "${COMPOSE[@]}" down -v --remove-orphans
+    "${COMPOSE[@]}" up -d --wait
+    "${COMPOSE[@]}" exec -T api hera-bench setup-site --company "Royal Technologies" --currency NGN --admin-email admin@local.test
+    "${COMPOSE[@]}" exec -T api hera-bench seed-coa
+    "${COMPOSE[@]}" exec -T api hera-bench seed-demo
+    note "Playwright login against Compose …"
+    "${COMPOSE[@]}" --profile e2e run --rm e2e
+  fi
+  if [ "$down" = "0" ]; then
+    note "test project left running (fast re-runs); tear down with: ./hera test down --volumes"
+  fi
+}
+
+# --- seed ---------------------------------------------------------------------
+
+cmd_seed() { # ENV [--all|--coa|--demo|--assets|--playground] [--company NAME] [--password PW]
+  if [ $# -eq 0 ]; then usage_seed; return 0; fi
+  local env="$1"
+  shift
+  case "$env" in dev|prod|test) ;; -h|--help) usage_seed; exit 0 ;; *) die "unknown environment: $env (want dev, prod or test)" ;; esac
+  local want_coa=0 want_demo=0 want_assets=0 want_playground=0 want_all=0
+  local company="" password=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) want_all=1; shift ;;
+      --coa) want_coa=1; shift ;;
+      --demo) want_demo=1; shift ;;
+      --assets) want_assets=1; shift ;;
+      --playground) want_playground=1; shift ;;
+      --company) need_arg "$1" "${2:-}"; company="$2"; shift 2 ;;
+      --password) need_arg "$1" "${2:-}"; password="$2"; shift 2 ;;
+      -h|--help) usage_seed; exit 0 ;;
+      *) die "unknown flag for seed: $1 (see ./hera seed --help)" ;;
+    esac
+  done
+  # Defaults: dev gets the whole playground (it is a superset of coa+demo+
+  # assets); prod gets only the starter chart unless asked for more.
+  if [ "$want_all$want_coa$want_demo$want_assets$want_playground" = "00000" ]; then
+    if [ "$env" = "prod" ]; then want_coa=1; else want_playground=1; fi
+  fi
+  if [ "$want_all" = "1" ]; then
+    if [ "$env" = "prod" ]; then want_coa=1; want_demo=1; want_assets=1
+    else want_playground=1; fi
+  fi
+  # Refused before touching Docker: demo money must never reach real books.
+  if [ "$env" = "prod" ] && [ "$want_playground" = "1" ]; then
+    die "seed --playground is refused on prod — it posts demo money and publishes a password (use --coa/--demo/--assets)"
+  fi
+  if [ -n "$password" ] && [ "$want_playground" = "0" ]; then
+    die "--password only applies to --playground"
+  fi
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  local coa_args=(seed-coa) demo_args=(seed-demo) assets_args=(seed-assets) pg_args=(seed-playground)
+  if [ -n "$company" ]; then
+    coa_args+=(--company "$company"); demo_args+=(--company "$company")
+    assets_args+=(--company "$company"); pg_args+=(--company "$company")
+  fi
+  [ -n "$password" ] && pg_args+=(--password "$password")
+  local failed=0
+  run_seed() {
+    if ! bench "$env" "$@"; then
+      echo "hera: seeding failed — if the site is not bootstrapped yet, finish the /setup wizard" >&2
+      echo "  in the browser first, or run: ./hera $env setup --company \"My Company\"" >&2
+      failed=1
+    fi
+    return 0
+  }
+  [ "$want_coa" = "1" ] && run_seed "${coa_args[@]}"
+  [ "$want_demo" = "1" ] && [ "$failed" = "0" ] && run_seed "${demo_args[@]}"
+  [ "$want_assets" = "1" ] && [ "$failed" = "0" ] && run_seed "${assets_args[@]}"
+  [ "$want_playground" = "1" ] && [ "$failed" = "0" ] && run_seed "${pg_args[@]}"
+  [ "$failed" = "1" ] && exit 1
+  return 0
+}
+
+# --- logs ---------------------------------------------------------------------
+
+cmd_logs() { # ENV [service] [--tail N] [-f|--follow] [--no-follow] [--since X]
+  if [ $# -eq 0 ]; then usage_logs; return 0; fi
+  local env="$1"
+  shift
+  case "$env" in dev|prod|test) ;; -h|--help) usage_logs; exit 0 ;; *) die "unknown environment: $env (want dev, prod or test)" ;; esac
+  local service="" tail="100" follow=1 since=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tail) need_arg "$1" "${2:-}"; tail="$2"; shift 2 ;;
+      -f|--follow) follow=1; shift ;;
+      --no-follow) follow=0; shift ;;
+      --since) need_arg "$1" "${2:-}"; since="$2"; shift 2 ;;
+      -h|--help) usage_logs; exit 0 ;;
+      -*) die "unknown flag for logs: $1 (see ./hera logs --help)" ;;
+      *) [ -n "$service" ] && die "logs takes one service (got $service and $1)"
+         service="$1"; shift ;;
+    esac
+  done
+  if [ -n "$service" ]; then
+    local valid="api worker web proxy db redis migrate backup e2e"
+    case " $valid " in *" $service "*) ;; *)
+      die "unknown service: $service (want one of: $valid)" ;;
+    esac
+    if [ "$service" = "backup" ] && [ "$env" != "prod" ]; then
+      die "the backup sidecar only exists on prod (dev/test back up through api)"
+    fi
+    if [ "$service" = "e2e" ] && [ "$env" != "test" ]; then
+      die "the e2e runner only exists on test"
+    fi
+  fi
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  local args=(logs --tail "$tail")
+  [ "$follow" = "1" ] && args+=(-f)
+  [ -n "$since" ] && args+=(--since "$since")
+  [ -n "$service" ] && args+=("$service")
+  "${COMPOSE[@]}" "${args[@]}"
+}
+
+# --- apps ---------------------------------------------------------------------
+
+cmd_apps() { # ENV list | enable NAME | disable NAME | new NAME [--title T] [--description D]
+  if [ $# -eq 0 ]; then usage_apps; return 0; fi
+  local env="$1"
+  shift
+  case "$env" in dev|prod|test) ;; -h|--help) usage_apps; exit 0 ;; *) die "unknown environment: $env (want dev, prod or test)" ;; esac
+  local arg
+  for arg in "$@"; do
+    case "$arg" in -h|--help) usage_apps; return 0 ;; esac
+  done
+  local action="${1:-list}"
+  case "$action" in
+    -h|--help) usage_apps; exit 0 ;;
+    list)
+      [ $# -le 1 ] || die "apps list takes no arguments"
+      need_docker
+      EF="$(active_env_file "$env")"
+      [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+      compose_for "$env"
+      bench "$env" list-apps
+      ;;
+    enable|disable)
+      [ $# -le 2 ] || die "apps $action takes exactly one app name"
+      local name="${2:-}"
+      [[ "$name" != -* ]] || die "invalid app name: $name"
+      [ -n "$name" ] || die "./hera apps $env $action needs an app name (see ./hera apps $env list)"
+      need_docker
+      EF="$(active_env_file "$env")"
+      [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+      compose_for "$env"
+      if [ "$action" = "enable" ]; then bench "$env" enable-app "$name"
+      else bench "$env" disable-app "$name"; fi
+      ;;
+    new)
+      local name="${2:-}"
+      [ -n "$name" ] || die "./hera apps $env new needs a module name"
+      shift 2
+      [ "$env" = "prod" ] && die "scaffold in dev, not prod: prod has no source mount, so the files would vanish with the container. Run ./hera apps dev new $name, commit, release, then ./hera apps prod enable $name."
+      local title="" description=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --title) need_arg "$1" "${2:-}"; title="$2"; shift 2 ;;
+          --description) need_arg "$1" "${2:-}"; description="$2"; shift 2 ;;
+          *) die "unknown flag for apps new: $1 (see ./hera apps --help)" ;;
+        esac
+      done
+      need_docker
+      EF="$(active_env_file "$env")"
+      [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+      compose_for "$env"
+      local args=(new-module "$name")
+      [ -n "$title" ] && args+=(--title "$title")
+      [ -n "$description" ] && args+=(--description "$description")
+      bench "$env" "${args[@]}"
+      note "scaffolded — wire it up, commit it, and enable with: ./hera apps $env enable $name"
+      ;;
+    *) die "unknown apps action: $action (want list, enable, disable or new)" ;;
+  esac
+}
+
+# --- backup -------------------------------------------------------------------
+
+backup_service_for() { # ENV — prod has a sidecar; dev/test back up through api
+  if [ "$1" = "prod" ]; then printf 'backup'; else printf 'api'; fi
+}
+
+cmd_backup() { # ENV [--list] [--restore FILE] [--yes] [--no-upload] [--retain-days N] [--out DIR]
+  if [ $# -eq 0 ]; then usage_backup; return 0; fi
+  local env="$1"
+  shift
+  case "$env" in dev|prod|test) ;; -h|--help) usage_backup; exit 0 ;; *) die "unknown environment: $env (want dev, prod or test)" ;; esac
+  local list=0 restore_file="" no_upload=0 retain_days="" out=""; ASSUME_YES=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --list) list=1; shift ;;
+      --restore) need_arg "$1" "${2:-}"; restore_file="$2"; shift 2 ;;
+      --yes) ASSUME_YES=1; shift ;;
+      --no-upload) no_upload=1; shift ;;
+      --retain-days) need_arg "$1" "${2:-}"; retain_days="$2"; shift 2 ;;
+      --out) need_arg "$1" "${2:-}"; out="$2"; shift 2 ;;
+      -h|--help) usage_backup; exit 0 ;;
+      *) die "unknown flag for backup: $1 (see ./hera backup --help)" ;;
+    esac
+  done
+  [ "$list" = "1" ] && [ -n "$restore_file" ] && die "--list and --restore cannot be combined"
+  if [ -n "$retain_days" ]; then
+    [[ "$retain_days" =~ ^[1-9][0-9]*$ ]] || die "--retain-days must be a positive integer"
+  fi
+  need_docker
+  EF="$(active_env_file "$env")"
+  [ -n "$EF" ] || die "no $env env file yet (run ./hera $env up first)"
+  compose_for "$env"
+  local svc
+  svc="$(backup_service_for "$env")"
+
+  if [ "$list" = "1" ]; then
+    require_up "$env"
+    "${COMPOSE[@]}" exec -T "$svc" sh -lc 'ls -lh /backups'
+    return 0
+  fi
+
+  if [ -n "$restore_file" ]; then
+    local file="$restore_file"
+    case "$file" in /backups/*) ;; *) file="/backups/$(basename "$file")" ;; esac
+    "${COMPOSE[@]}" run --rm --no-deps api test -r "$file" || die "backup not readable: $file"
+    confirm "restore $file over the $env database? ALL CURRENT $env DATA WILL BE REPLACED."
+    local writers="api worker"
+    [ "$env" = "prod" ] && writers="api worker backup"
+    note "stopping writers ($writers) so nothing writes mid-restore …"
+    # Word-splitting writers is deliberate: it is a word list by construction.
+    # shellcheck disable=SC2086
+    "${COMPOSE[@]}" stop $writers
+    note "restoring $file …"
+    set +e
+    "${COMPOSE[@]}" run --rm --no-deps api hera-bench restore "$file"
+    local status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+      die "restore failed (exit $status) — writers remain stopped; investigate before running ./hera $env up"
+    fi
+    note "starting the stack again …"
+    "${COMPOSE[@]}" up -d --wait || { up_failed "$env"; die "restore completed but stack startup failed"; }
+    note "restored from $file — sign in and verify the data."
+    return 0
+  fi
+
+  # Immediate backup.
+  require_up "$env"
+  local args=(backup)
+  [ "$no_upload" = "1" ] && args+=(--no-upload)
+  [ -n "$retain_days" ] && args+=(--retain-days "$retain_days")
+  [ -n "$out" ] && args+=(--out "$out")
+  "${COMPOSE[@]}" exec -T "$svc" hera-bench "${args[@]}"
+}
+
+# --- env groups ---------------------------------------------------------------
+
+cmd_env() { # dev|prod SUBCOMMAND... — lifecycle for one environment
+  local env="$1"; shift
+  local sub="${1:-up}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    up) cmd_up "$env" "$@" ;;
+    down) cmd_down "$env" "$@" ;;
+    restart) cmd_restart "$env" "$@" ;;
+    ps) cmd_ps "$env" "$@" ;;
+    logs) cmd_logs "$env" "$@" ;;
+    shell) cmd_shell "$env" "$@" ;;
+    setup) cmd_setup "$env" "$@" ;;
+    doctor) cmd_doctor "$env" "$@" ;;
+    build) cmd_build "$env" "$@" ;;
+    url) cmd_url "$env" "$@" ;;
+    update)
+      [ "$env" = "prod" ] || die "only prod updates from pinned images (dev rebuilds with ./hera dev build)"
+      cmd_prod_update "$@" ;;
+    -h|--help|help) usage_env "$env" ;;
+    *) die "unknown command: ./hera $env $sub (see ./hera $env --help)" ;;
+  esac
+}
+
+# --- help ---------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+hera — the one Hera command. One command per environment, one file to edit.
+
+  ./hera dev up                  localhost trial (build, start, /setup wizard)
+  ./hera prod up --domain ...    production (pinned images, HTTPS, same wizard)
+  ./hera test                    tests in Compose (CI-equivalent, fresh database)
+  ./hera seed dev|prod           seed data (playground on dev, starter chart on prod)
+  ./hera logs dev|prod [svc]     view logs (all services, or one)
+  ./hera apps dev|prod ...       list, enable, disable, scaffold optional apps
+  ./hera backup dev|prod         manual backup, list dumps, restore
+
+Environments own one editable file each (generated on first boot, never
+regenerated): deploy/.env.dev, deploy/.env.prod, deploy/.env.test. A legacy
+deploy/.env is honoured for dev/prod only when the owned file is absent.
+
+Use -h or --help at any command level. Help never contacts Docker.
+
+Per-command help:
+
+  ./hera dev --help      ./hera dev up --help      (lifecycle: up, down,
+  ./hera prod --help     ./hera prod up --help      restart, ps, logs, shell,
+  ./hera test --help     ./hera seed --help         setup, doctor, build, url;
+  ./hera logs --help     ./hera apps --help         prod also has update)
+  ./hera backup --help
+
+Full reference (every flag, every customization, raw docker compose
+equivalents): docs/deployment.md
+EOF
+}
+
+usage_env() {
+  local env="$1" owned extra
+  owned="$(target_env_file "$env")"
+  if [ "$env" = "prod" ]; then
+    extra="  ./hera prod update --pin vX.Y.Z   upgrade to a release (digests only, secrets untouched)"
+  else
+    extra="  ./hera dev build [svc]        rebuild images (after pulling commits that changed deps)"
+  fi
+  cat <<EOF
+./hera $env — lifecycle for the $env stack (env file: $owned).
+
+  ./hera $env up [flags]       generate env on first boot, then start
+  ./hera $env down [--volumes]  stop (keep data) or stop and WIPE (--volumes, asks first)
+  ./hera $env restart [svc]     restart all services, or one
+  ./hera $env ps [-a]           running containers (-a: including stopped)
+  ./hera $env logs [svc] [..]   same as ./hera logs $env (see ./hera logs --help)
+  ./hera $env shell [svc] [..]  open a shell in a container (default: api)
+  ./hera $env setup [flags]     scripted bootstrap (the /setup wizard is the other door)
+  ./hera $env doctor            health report from inside the stack
+  ./hera $env url               print the desk URL
+$extra
+EOF
+}
+
+usage_up() {
+  local env="$1"
+  if [ "$env" = "prod" ]; then
+    cat <<'EOF'
+./hera prod up — start production (pinned images, Caddy HTTPS).
+
+First boot (generates deploy/.env.prod — secrets, digests, allowlists):
+
+  ./hera prod up --domain books.example.com --pin vX.Y.Z
+  ./hera prod up --domain books.example.com --channel stable --acme-email ops@example.com
+
+Later boots (the env file is kept; digests change only via prod update):
+
+  ./hera prod up
+
+Flags (first boot persists them into the env file; later they apply one-shot):
+
+  --domain NAME          required on first boot (HTTPS, CORS, trusted hosts)
+  --pin vX.Y.Z           pin every image digest from that release's manifest
+  --channel stable|beta  pin whatever the rolling tag currently resolves to
+  --acme-email ADDR      CA expiry notices (default: ops@<domain>)
+  --http-port N          host HTTP port (default 80)
+  --https-port N         host HTTPS port (default 443)
+  --admin-email ADDR     scripted bootstrap only (default admin@local.test)
+  --no-pull              skip the image pull (debugging only)
+  --fresh --yes          wipe volumes first (DANGER: deletes all prod data)
+  --no-wait              do not wait for health (debugging only)
+
+With only the downloaded hera file, this command clones the public deployment
+bundle automatically (Git, Docker/Compose, curl and OpenSSL required).
+The private source repository is never cloned. The legacy install.sh entry —
+see docs/deployment.md (no-clone path).
+EOF
+  else
+    cat <<'EOF'
+./hera dev up — start the localhost stack (images built from source).
+
+  ./hera dev up                  build if needed, start, print the wizard URL
+  ./hera dev up --hmr            Vite dev server in hera-web (hot module replacement)
+  ./hera dev up --build          force a rebuild first (after git pull changed deps)
+  ./hera dev up --port 9000      serve on http://localhost:9000
+  ./hera dev up --fresh          wipe volumes first (DANGER: deletes all dev data)
+
+Flags (first boot persists --port/--admin-email into deploy/.env.dev; later
+boots keep the file and --port applies one-shot):
+
+  --port N / --http-port N   host port for the desk (default 8080)
+  --admin-email ADDR         scripted bootstrap only (default admin@local.test)
+  --hmr                      layer the Vite-HMR overlay (dev server, hot reload)
+  --build                    rebuild images before starting
+  --fresh --yes              down -v first (DANGER: deletes all dev data)
+  --no-wait                  do not wait for health (debugging only)
+EOF
+  fi
+}
+
+usage_down() {
+  cat <<EOF
+./hera $1 down — stop the $1 stack.
+
+  ./hera $1 down                stop, keep data (volumes survive)
+  ./hera $1 down --volumes      stop and WIPE the site (asks first; --yes skips)
+EOF
+}
+
+usage_setup() {
+  cat <<EOF
+./hera $1 setup — scripted bootstrap (CI, restores, automation).
+
+The browser's /setup wizard is the other door and does the same thing. One of
+the two must run before the site is usable (until then the API answers 409
+setup_required).
+
+  ./hera $1 setup --company "Royal Technologies" --currency NGN --admin-email admin@example.com
+
+  --company NAME       company to create (default: My Company)
+  --currency CODE      default currency (default: NGN)
+  --admin-email ADDR   Administrator login (default: HERA_ADMIN_EMAIL in the env file)
+  --timezone ZONE      IANA zone (default: HERA_DEFAULT_TIMEZONE in the env file)
+
+The Administrator password comes from HERA_ADMIN_PASSWORD in the env file —
+it is never a CLI flag (shell history keeps flags forever).
+EOF
+}
+
+usage_prod_update() {
+  cat <<'EOF'
+./hera prod update — upgrade production to another release.
+
+Only the five image digests change (plus HERA_VERSION on --pin); secrets are
+never regenerated. The old env file is backed up next to itself first.
+
+  ./hera prod update --pin vX.Y.Z          exact release (needs no docker to plan)
+  ./hera prod update --channel stable     rolling tag, pinned by digest at pull time
+
+Volumes, secrets and the site survive; the new migrate run applies schema
+changes before the new api starts.
+EOF
+}
+
+usage_test() {
+  cat <<'EOF'
+./hera test — the CI suite, locally, in Compose (project hera-test).
+
+  ./hera test                    pytest on a FRESH database (CI-faithful default)
+  ./hera test tests/test_ledger.py -q   pytest args pass straight through
+  ./hera test --maxfail=1 -q      pytest long and short flags pass through
+  ./hera test -- --help           pytest help (flags after -- belong to pytest)
+  ./hera test --lint             ruff + mypy in the runtime image, then pytest
+  ./hera test --e2e              pytest, then full stack + Playwright login
+  ./hera test --keep             reuse the test volume instead of wiping first
+  ./hera test --build            rebuild the test image first
+  ./hera test --down             tear down afterwards, even on failure
+  ./hera test down --volumes     tear down (any time)
+  ./hera test logs [service]     logs of the test project
+
+The env file (deploy/.env.test) is generated with test-only values on the
+first run; never falls back to deploy/.env. E2E resets the database after
+pytest, even with --keep. The stack is left running by default for inspection.
+EOF
+}
+
+usage_seed() {
+  cat <<'EOF'
+./hera seed — seed data through the real services (idempotent: re-runs add nothing).
+
+  ./hera seed dev                full playground site (the dev default)
+  ./hera seed dev --coa          starter NGN chart only
+  ./hera seed dev --demo         demo parties, items, VAT, employees, fixtures
+  ./hera seed dev --assets       demo fixed assets + depreciation
+  ./hera seed dev --company "Acme Ltd"      seed that company (multi-company sites)
+  ./hera seed prod --coa         starter NGN chart (the prod default)
+  ./hera seed prod --all         chart + demo + assets (never the playground)
+
+  --all            dev: the playground (a superset of everything below).
+                   prod: --coa + --demo + --assets.
+  --coa            starter chart of accounts, default accounts, fiscal year, bank mirrors
+  --demo           demo masters: parties, service items, VAT templates, employees,
+                   the Paystack fixture replay, CRM leads
+  --assets         demo fixed assets + three months of depreciation
+  --playground     the full demo site: role logins, invoices in every state,
+                   reconciled bank statement, paid payroll, CRM, stock, assets,
+                   messaging timeline. REFUSED on prod (posts demo money).
+  --company NAME   which company to seed (required once the site has two)
+  --password TEXT  playground users' password (default: see docs/playground.md)
+
+Seed after bootstrapping (the /setup wizard or ./hera <env> setup).
+EOF
+}
+
+usage_logs() {
+  cat <<'EOF'
+./hera logs — view logs (Compose logs with sane defaults: follow, last 100 lines).
+
+  ./hera logs dev                 follow everything on dev
+  ./hera logs prod api            follow the prod API
+  ./hera logs dev db --no-follow  print the last 100 db lines and exit
+  ./hera logs prod --tail 500     follow everything, deeper history
+  ./hera logs test e2e            the Playwright run's output
+  ./hera dev logs worker          same thing, grouped under the environment
+
+  --tail N       lines of history per service (default 100)
+  -f, --follow   follow (default)
+  --no-follow    print and exit
+  --since X      only logs since X (e.g. 1h, 2026-09-01T00:00:00Z)
+
+Services: api worker web proxy db redis migrate (plus backup on prod, e2e on test).
+Raw equivalent: docker compose --env-file <env> -f <file> -p <project> logs -f [service]
+EOF
+}
+
+usage_apps() {
+  cat <<'EOF'
+./hera apps — optional apps, including future registered modules.
+
+Framework modules (identity, desk, parties, accounting, HRM, payments,
+messaging) are always on. Optional apps install per site:
+
+  ./hera apps dev list            framework modules + apps, with enable state
+  ./hera apps dev enable crm      install + enable (routes appear immediately)
+  ./hera apps dev disable crm     disable (routes 404, data stays)
+  ./hera apps prod enable crm     same on prod (the release image must contain it)
+  ./hera apps dev new hotel-pms --title "Hotel PMS" --description "..."
+                                  scaffold a future app (refused on prod:
+                                  scaffold in dev, commit, release, then enable)
+
+Scaffolding writes modules/<name>/ (manifest, router, models, service,
+lifecycle, migration) through the dev source mount, so the files land in your
+checkout ready to commit.
+EOF
+}
+
+usage_backup() {
+  cat <<'EOF'
+./hera backup — manual backups (pg_dump) and restores.
+
+Prod runs a backup sidecar on a schedule; dev/test back up through api (all
+environments have separate project-scoped backup volumes).
+Dumps are hera-YYYYmmdd-HHMMSS.dump.
+
+  ./hera backup prod              immediate backup now (uploads offsite when S3 is set)
+  ./hera backup dev               immediate backup of dev
+  ./hera backup prod --list       list the dumps on the volume
+  ./hera backup prod --no-upload  skip the S3 copy this once
+  ./hera backup prod --retain-days 30 --out /backups/audit
+  ./hera backup prod --restore hera-20260101-000000.dump
+                                  REPLACE the database with a dump (asks first;
+                                  writers stop; restart only after success)
+
+--restore takes a path inside the container (/backups/...) or a bare dump
+name. Never test a restore over the only copy of production — drill on a
+throwaway project first (docs/runbook.md section 4).
+EOF
+}
+
+# A downloaded `hera` is also the production bootstrap. No private checkout,
+# credentials or application source is needed. Keep state outside release trees.
+bootstrap_public() {
+  local args=("$@") arg pin="" channel="" ref="main" refresh=0
+  local public_repo="MartinKyng/Hera-Operating-System"
+  [ "${HERA_REPO:-$public_repo}" = "$public_repo" ] || die "production bootstrap uses only the public release repository $public_repo"
+  for arg in "$@"; do
+    case "$arg" in -h|--help) return 0 ;; esac
+  done
+  case "${1:-}" in
+    help|-h|--help|version|--version|-V|"") return 0 ;;
+    prod) [ "${2:-up}" != "update" ] || refresh=1 ;;
+    backup|logs|seed|apps) [ "${2:-}" = "prod" ] || die "development requires a source checkout; standalone hera supports production only" ;;
+    *) die "development requires a source checkout; standalone hera supports production only" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pin) need_arg "$1" "${2:-}"; pin="$2"; shift 2 ;;
+      --channel) need_arg "$1" "${2:-}"; channel="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -z "$pin" ] || [[ "$pin" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]] || die "--pin must be a release tag (vX.Y.Z or vX.Y.Z-beta.N)"
+  [ -z "$pin" ] || [ -z "$channel" ] || die "--pin and --channel are exclusive"
+  case "$channel" in ""|stable) ;; beta) ref=dev ;; *) die "--channel must be stable or beta" ;; esac
+  [ -z "$pin" ] || ref="$pin"
+  if [ "$refresh" = 1 ] && [ -z "$pin$channel" ]; then die "prod update needs --pin or --channel"; fi
+  local current="$SELF_DIR/.hera-release" stage="" file
+  if [ ! -L "$current" ] || [ "$refresh" = 1 ]; then
+    [ ! -e "$current" ] || [ -L "$current" ] || die "$current must be a managed release symlink, not an existing directory"
+    need_bin git "git is required to download the public deployment files"
+    need_docker
+    mkdir -p "$SELF_DIR/.hera-releases"
+    stage="$(mktemp -d "$SELF_DIR/.hera-releases/release.XXXXXX")"
+    note "cloning public deployment bundle $public_repo ($ref); no private source"
+    if ! GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null clone --quiet --depth 1 --single-branch --branch "$ref" "https://github.com/$public_repo.git" "$stage"; then
+      rm -rf "$stage"
+      die "could not download the public release $ref; previous deployment is unchanged"
+    fi
+    for file in hera deploy/install.sh deploy/docker-compose.prod.yml deploy/Caddyfile.prod deploy/postgres/init-roles.sh deploy/Dockerfile .env.example VERSION; do
+      if [ ! -f "$stage/$file" ] || [ -L "$stage/$file" ]; then
+        rm -rf "$stage"
+        die "public release $ref is missing $file; publish the new deployment bundle first"
+      fi
+    done
+    # Refuse a mistakenly published source tree; the release CI has a strict
+    # allowlist too. Do not execute code from an incomplete/source bundle.
+    if [ -e "$stage/services" ] || [ -e "$stage/apps" ]; then
+      rm -rf "$stage"; die "public deployment bundle unexpectedly contains application source"
+    fi
+    chmod +x "$stage/hera" "$stage/deploy/install.sh"
+  fi
+  # The project name and state paths never depend on the cloned release name.
+  # Prior release trees remain available for operator-led rollback; no volumes
+  # or secrets are removed on re-run/update.
+  export HERA_PROD_ENV_FILE="$PROD_ENV_FILE" HERA_LEGACY_ENV_FILE="$LEGACY_ENV_FILE" HERA_PROD_PROJECT
+  if [ -n "$stage" ]; then
+    # Promote only after the requested command succeeds. Failed downloads or
+    # starts keep the previous bundle pointer; env backups are made by update.
+    local status=0
+    "$stage/hera" "${args[@]}" || status=$?
+    if [ "$status" = 0 ]; then
+      ln -s "$stage" "${stage}.link"
+      mv -Tf "${stage}.link" "$current"
+    fi
+    exit "$status"
+  fi
+  exec "$current/hera" "${args[@]}"
+}
+
+valid_release_pin() {
+  [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]] || die "--pin must be a release tag (vX.Y.Z or vX.Y.Z-beta.N)"
+}
+
+validate_hub_image() {
+  [[ "$2" =~ ^docker\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]] \
+    || die "$1 must be an untagged docker.io repository; other image registries are not allowed"
+}
+
+validate_prod_images() {
+  local key value
+  for key in HERA_API_IMAGE HERA_WEB_IMAGE; do
+    value="${!key-$(env_value "$key" "$EF" '')}"
+    validate_hub_image "$key" "$value"
+  done
+}
+
+# --- main ---------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    dev|prod) cmd_env "$@" ;;
+    test) cmd_test "$@" ;;
+    seed) shift; cmd_seed "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    apps) shift; cmd_apps "$@" ;;
+    backup) shift; cmd_backup "$@" ;;
+    version|--version|-V)
+      if [ -f "$VERSION_FILE" ]; then echo "hera $(tr -d '[:space:]' < "$VERSION_FILE")";
+      else echo "hera (no VERSION file — dev checkout?)"; fi ;;
+    help|--help|-h|"") usage ;;
+    *) die "unknown command: $cmd (see ./hera help)" ;;
+  esac
+}
+
+[ -f "$INSTALL_SH" ] || bootstrap_public "$@"
+main "$@"
