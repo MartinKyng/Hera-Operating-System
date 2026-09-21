@@ -1,31 +1,33 @@
 # Onboarding a Hera OS site
 
-Everything here happens through the downloaded `hera` file and the browser.
-There is no application source checkout or hand-copied digest.
+Everything here happens through the public deployment repository, the `./hera`
+command and the browser. There is no application source checkout, local image
+build or hand-copied digest.
 
 ## 1. Install
 
-Download the CLI once, then run the single deployment command:
+Clone the public deployment repo, then run the Hera deployment command:
 
 ```bash
-curl -fsSLo hera https://raw.githubusercontent.com/MartinKyng/Hera-Operating-System/main/hera
-bash hera prod up --domain books.example.com --channel stable --acme-email ops@example.com
+git clone --depth 1 https://github.com/MartinKyng/Hera-Operating-System.git hera-os \
+  && cd hera-os \
+  && ./hera prod up --domain books.example.com --channel stable --acme-email ops@example.com
 ```
 
 The host needs Linux, Bash, Git, Docker Engine/Compose v2, curl and OpenSSL.
-DNS must point to it and ports 80/443 must be open for Caddy HTTPS. The CLI
-clones only the public distribution, pulls only Docker Hub images, and writes
-`deploy/.env.prod` once with generated secrets. Re-running `bash hera prod up`
-keeps that file and the existing image pins. Back it up securely; never use
-`--force` or `--fresh` for upgrades. Use `bash hera prod update --channel stable`
-(or an actual published `--pin vX.Y.Z`) after taking a verified backup.
+DNS must point to it and ports 80/443 must be open for Caddy HTTPS. `./hera`
+pulls only Docker Hub images and writes `deploy/.env.prod` once with generated
+secrets. Re-running `./hera prod up` keeps that file and the existing image
+pins. Back it up securely; never use `--fresh` for upgrades. Use
+`./hera prod update --channel stable` (or an actual published `--pin vX.Y.Z`)
+after taking a verified backup.
 
 See [the README](../README.md) for saved paths, versioned bundles and migration
 of legacy installations without changing project names or secrets.
 
 ## 2. Complete the `/setup` wizard
 
-The installer prints a URL. Open it and enter:
+`./hera` prints a URL. Open it and enter:
 
 - the first **Administrator** (email and password)
 - the **company** name
@@ -44,47 +46,47 @@ until enrolment is complete.
 
 ## How the stack comes up
 
-`docker compose up -d --wait` starts a one-shot `migrate` service first. The
-API and worker wait for it to complete successfully, so a failing migration
-surfaces as an explicit `migrate exited (1)` rather than an API container
-sitting "unhealthy" with the real error buried in its logs.
+`./hera prod up` generates the env file if needed, pins images by digest, pulls
+images, starts the stack and waits for health. The production Compose stack
+starts a one-shot `migrate` service first. The API and worker wait for it to
+complete successfully, so a failing migration surfaces as an explicit
+`migrate exited (1)` rather than an API container sitting "unhealthy" with the
+real error buried in its logs.
 
 Service roles in Postgres are least-privilege and are created only on the first
 boot of the data volume: `hera_app` (the application), `hera_migrate`
 (migrations), `hera_backup` (dumps). Regenerating those passwords against an
-existing volume will lock the site out — which is why `install.sh` refuses to
-rewrite an existing `.env` without `--force`.
+existing volume will lock the site out — which is why `./hera` never rewrites
+an existing env file during ordinary deploys or upgrades.
 
 ## When it does not come up
 
-`install.sh --up` checks that the proxy's host ports (80/443 by default) are
+`./hera prod up` checks that the proxy's host ports (80/443 by default) are
 free **before** pulling images. If something else holds one — nginx, apache, a
-second stack — it says which container or tells you the `ss` command to find
-the host process, and suggests `--http-port`/`--https-port`. Nothing has been
-started and no volume has been touched.
+second stack — it says which container or tells you how to move Hera to a free
+port with `--http-port`/`--https-port`. Nothing has been started and no volume
+has been touched.
 
-If `up -d --wait` still fails, it prints a state table for every service, the
-logs of the ones implicated, and the cause: a failed migration (api and worker
-wait on it), a host port conflict (**your data is fine — `down -v` is not the
-fix**), an image the registry refused (`docker login docker.io`, or re-pin), or a
-container that never turned healthy in time (read the logs, re-run `--up`).
+If startup still fails, `./hera` prints a state table, service logs, and the
+cause: a failed migration (api and worker wait on it), a host port conflict
+(**your data is fine — wiping volumes is not the fix**), an image the registry
+refused, or a container that never turned healthy in time. Continue with
+`./hera logs prod <service>` and `./hera prod doctor`.
 
 ## Useful flags
 
 | Flag | Effect |
 |---|---|
-| `--env prod\|dev` | production stack with HTTPS, or a localhost trial |
-| `--domain HOST` | required in prod; derives CORS, trusted hosts and the public URL |
+| `--domain HOST` | required on first prod boot; derives CORS, trusted hosts and the public URL |
 | `--pin vX.Y.Z` | pin every image by digest from that release's `images.env` |
-| `--channel stable\|beta` | pin whatever the rolling tag resolves to (needs Docker) |
-| `--http-port N` | publish the proxy on a different host port (dev: 8080, prod: 80) |
-| `--https-port N` | prod only: the TLS port (default 443) |
-| `--bundle DIR` | write a transferable deploy directory |
-| `--force` | regenerate an existing `.env` (breaks issued JWTs) |
-| `--up` | bring the stack up and wait for health |
+| `--channel stable\|beta` | pin whatever the rolling tag resolves to |
+| `--http-port N` | publish the proxy on a different host HTTP port (default 80) |
+| `--https-port N` | the TLS port (default 443) |
+| `--no-pull` | use locally available pinned images (debugging only) |
+| `--no-wait` | return before health is established (debugging only) |
 
 ## Payment provider keys
 
 Paystack and Flutterwave keys, and WhatsApp/SMTP credentials, are deliberately
-**not** generated by the installer. They are per-company settings entered in
-the `/setup` wizard or the desk, and are encrypted at rest.
+**not** generated by `./hera`. They are per-company settings entered in the
+`/setup` wizard or the desk, and are encrypted at rest.

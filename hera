@@ -38,7 +38,6 @@ HERA_TEST_PORT="${HERA_TEST_PORT:-8081}"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SELF_DIR"
 DEPLOY_DIR="$REPO_ROOT/deploy"
-INSTALL_SH="$DEPLOY_DIR/install.sh"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 VERSION_FILE="$REPO_ROOT/VERSION"
 COMPOSE_BASE="$DEPLOY_DIR/docker-compose.yml"
@@ -46,9 +45,9 @@ COMPOSE_DEV_OVERLAY="$DEPLOY_DIR/docker-compose.dev.yml"
 COMPOSE_TEST_OVERLAY="$DEPLOY_DIR/docker-compose.test.yml"
 COMPOSE_PROD="$DEPLOY_DIR/docker-compose.prod.yml"
 
-# Third-party tags must match deploy/install.sh — keep the two in sync.
-# (First-party images are read back from the prod env file at update time, so
-# a fork that repointed them keeps working.)
+PUBLIC_REPO="MartinKyng/Hera-Operating-System"
+DEFAULT_API_IMAGE="docker.io/kyngroyalty/hera-os"
+DEFAULT_WEB_IMAGE="docker.io/kyngroyalty/hera-os"
 POSTGRES_TAG="postgres:16-alpine"
 REDIS_TAG="redis:7-alpine"
 CADDY_TAG="caddy:2-alpine"
@@ -80,6 +79,161 @@ env_value() {
   printf '%s' "${value:-$3}"
 }
 
+hex() { openssl rand -hex "$1"; }
+
+manifest_value() { # MANIFEST KEY — first KEY= value, accepting optional sha256:
+  printf '%s\n' "$1" | sed -n "s/^$2=sha256://p; s/^$2=//p" | head -n1
+}
+
+pull_digest() { # IMAGE:TAG — pull and return the RepoDigest sha256 hex
+  docker pull --quiet "$1" >/dev/null 2>&1 || return 1
+  docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null | sed 's/^.*@sha256://'
+}
+
+generate_env_file() { # dev|prod TARGET DOMAIN PIN CHANNEL ACME HTTP HTTPS ADMIN_EMAIL
+  local env="$1" target="$2" domain="${3:-}" pin="${4:-}" channel="${5:-}" acme="${6:-}" http="${7:-}" https="${8:-}" admin="${9:-}"
+  local api_image="$DEFAULT_API_IMAGE" web_image="$DEFAULT_WEB_IMAGE"
+  local api_digest="" web_digest="" pg_digest="" rd_digest="" cd_digest=""
+  local version_value="" tmp key pair manifest url
+
+  [ -f "$ENV_EXAMPLE" ] || die "template not found: $ENV_EXAMPLE"
+  [ ! -e "$target" ] || die "$target already exists — secrets are generated once; re-run ./hera $env up to keep them, or edit deliberately"
+  [ -n "$admin" ] || admin="admin@local.test"
+
+  if [ "$env" = prod ]; then
+    [ "${HERA_REPO:-$PUBLIC_REPO}" = "$PUBLIC_REPO" ] || die "production uses only the public release repository $PUBLIC_REPO"
+    [ -n "$domain" ] || die "the first prod boot needs --domain (e.g. ./hera prod up --domain books.example.com)"
+    for key in HERA_API_IMAGE HERA_WEB_IMAGE; do
+      [ -z "${!key+x}" ] || validate_hub_image "$key" "${!key}"
+    done
+    if [ -z "$pin" ] && [ -z "$channel" ]; then
+      channel="stable"
+      note "no --pin/--channel given — pinning the rolling 'stable' tag (pass --pin vX.Y.Z for an exact release)"
+    fi
+    if [ -n "$pin" ]; then
+      need_bin curl "--pin needs curl to fetch the release manifest"
+      url="https://github.com/${PUBLIC_REPO}/releases/download/${pin}/images.env"
+      note "fetching digest manifest $pin …"
+      manifest="$(curl -fsSL "$url")" || die "could not fetch $url (does the release exist?)"
+      api_image="$(manifest_value "$manifest" HERA_API_IMAGE)"
+      web_image="$(manifest_value "$manifest" HERA_WEB_IMAGE)"
+      [ -n "$api_image" ] && [ -n "$web_image" ] || die "manifest is missing image repositories"
+      validate_hub_image HERA_API_IMAGE "$api_image"
+      validate_hub_image HERA_WEB_IMAGE "$web_image"
+      api_digest="$(manifest_value "$manifest" HERA_API_DIGEST)"
+      web_digest="$(manifest_value "$manifest" HERA_WEB_DIGEST)"
+      pg_digest="$(manifest_value "$manifest" HERA_POSTGRES_DIGEST)"
+      rd_digest="$(manifest_value "$manifest" HERA_REDIS_DIGEST)"
+      cd_digest="$(manifest_value "$manifest" HERA_CADDY_DIGEST)"
+    else
+      need_bin docker "--channel pulls images, which needs docker (use --pin to read a release manifest)"
+      note "pulling ${api_image}:api-${channel} (and friends) to pin immutable digests …"
+      api_digest="$(pull_digest "${api_image}:api-${channel}")" || die "cannot pull ${api_image}:api-${channel} — was a $channel release published? (If Docker Hub is private: docker login docker.io)"
+      web_digest="$(pull_digest "${web_image}:web-${channel}")" || die "cannot pull ${web_image}:web-${channel}"
+      pg_digest="$(pull_digest "$POSTGRES_TAG")" || die "cannot pull $POSTGRES_TAG"
+      rd_digest="$(pull_digest "$REDIS_TAG")" || die "cannot pull $REDIS_TAG"
+      cd_digest="$(pull_digest "$CADDY_TAG")" || die "cannot pull $CADDY_TAG"
+    fi
+    for pair in "HERA_API_DIGEST:${api_digest}" "HERA_WEB_DIGEST:${web_digest}" \
+                "HERA_POSTGRES_DIGEST:${pg_digest}" "HERA_REDIS_DIGEST:${rd_digest}" \
+                "HERA_CADDY_DIGEST:${cd_digest}"; do
+      check_digest "${pair%%:*}" "${pair#*:}" "for ${pin:-$channel}"
+    done
+    note "pinned ${pin:-$channel}: api ${api_digest:0:12}… web ${web_digest:0:12}…"
+  fi
+
+  if [ -f "$VERSION_FILE" ]; then
+    version_value="$(tr -d '[:space:]' < "$VERSION_FILE")"
+  else
+    note "WARNING: no VERSION file at $VERSION_FILE — images will be labelled 'dev'"
+  fi
+
+  note "generating secrets …"
+  local hera_secret postgres_password db_app_password db_migrate_password db_backup_password redis_password admin_password
+  hera_secret="$(hex 32)"
+  postgres_password="$(hex 16)"
+  db_app_password="$(hex 16)"
+  db_migrate_password="$(hex 16)"
+  db_backup_password="$(hex 16)"
+  redis_password="$(hex 16)"
+  admin_password="$(hex 12)"
+
+  local -a managed=(
+    HERA_ENV HERA_DOMAIN HERA_SECRET_KEY HERA_VERSION
+    HERA_ADMIN_EMAIL HERA_ADMIN_PASSWORD HERA_HTTP_PORT HERA_HTTPS_PORT ACME_EMAIL
+    HERA_CORS_ORIGINS HERA_TRUSTED_HOSTS HERA_PUBLIC_BASE_URL
+    POSTGRES_PASSWORD HERA_DB_APP_PASSWORD HERA_DB_MIGRATE_PASSWORD HERA_DB_BACKUP_PASSWORD
+    REDIS_PASSWORD REDIS_URL
+    HERA_API_IMAGE HERA_WEB_IMAGE
+    HERA_API_DIGEST HERA_WEB_DIGEST HERA_POSTGRES_DIGEST HERA_REDIS_DIGEST HERA_CADDY_DIGEST
+  )
+  local -a delete_exprs=()
+  for key in "${managed[@]}"; do delete_exprs+=(-e "/^#?[[:space:]]*${key}=/d"); done
+
+  mkdir -p "$(dirname "$target")"
+  tmp="$(mktemp "${target}.tmp.XXXXXX")"
+  trap 'rm -f "${tmp:-}"' RETURN
+  sed -E "${delete_exprs[@]}" "$ENV_EXAMPLE" > "$tmp"
+
+  cat >> "$tmp" <<EOF
+
+# ---------------------------------------------------------------------------
+# Managed by ./hera ($(date -u +%Y-%m-%dT%H:%M:%SZ)) — generated secrets,
+# digest-pinned production images, derived allowlists. Do not duplicate these keys above.
+# ---------------------------------------------------------------------------
+
+# --- Core
+HERA_ENV=${env}
+HERA_VERSION=${version_value}
+HERA_DOMAIN=${domain:-localhost}
+HERA_SECRET_KEY=${hera_secret}
+# Used only by the scripted bootstrap (hera-bench setup-site, CI). The /setup
+# wizard asks for the Administrator in the browser and ignores these.
+HERA_ADMIN_EMAIL=${admin}
+HERA_ADMIN_PASSWORD=${admin_password}
+EOF
+
+  if [ "$env" = prod ]; then
+    cat >> "$tmp" <<EOF
+HERA_HTTP_PORT=${http:-80}
+HERA_HTTPS_PORT=${https:-443}
+ACME_EMAIL=${acme:-ops@${domain}}
+HERA_PUBLIC_BASE_URL=https://${domain}
+HERA_CORS_ORIGINS=https://${domain}
+HERA_TRUSTED_HOSTS=${domain},127.0.0.1,hera-api
+EOF
+  else
+    echo "HERA_HTTP_PORT=${http:-8080}" >> "$tmp"
+  fi
+
+  cat >> "$tmp" <<EOF
+
+# --- Postgres (three least-privilege roles; see deploy/postgres/init-roles.sh)
+POSTGRES_PASSWORD=${postgres_password}
+HERA_DB_APP_PASSWORD=${db_app_password}
+HERA_DB_MIGRATE_PASSWORD=${db_migrate_password}
+HERA_DB_BACKUP_PASSWORD=${db_backup_password}
+
+# --- Redis
+REDIS_PASSWORD=${redis_password}
+REDIS_URL=redis://:${redis_password}@hera-redis:6379/0
+
+# --- Images (Docker Hub only; prod digests pinned by ${pin:+--pin ${pin}}${channel:+--channel ${channel}}${pin:-${channel:-<none>}})
+HERA_API_IMAGE=${api_image}
+HERA_WEB_IMAGE=${web_image}
+HERA_API_DIGEST=${api_digest}
+HERA_WEB_DIGEST=${web_digest}
+HERA_POSTGRES_DIGEST=${pg_digest}
+HERA_REDIS_DIGEST=${rd_digest}
+HERA_CADDY_DIGEST=${cd_digest}
+EOF
+
+  chmod 600 "$tmp"
+  mv "$tmp" "$target"
+  trap - RETURN
+  note "wrote $target (mode: $env, images: $api_image, pin: ${pin:-${channel:-none}})"
+}
+
 need_arg() { # FLAG VALUE — every --flag value goes through here
   [ -n "${2:-}" ] && [[ "$2" != -* ]] || die "$1 needs a value (see the --help for this command)"
 }
@@ -97,9 +251,9 @@ confirm() { # PROMPT — honour --yes, refuse without a terminal, else ask.
 }
 
 # --- environment files ------------------------------------------------------
-# Each environment owns one editable file. A legacy deploy/.env (written by an
-# older install.sh) is honoured when the per-environment file does not exist
-# yet, so existing checkouts keep working with a visible note.
+# Each environment owns one editable file. A legacy deploy/.env is honoured
+# when the per-environment file does not exist yet, so existing checkouts keep
+# working with a visible note.
 
 target_env_file() { # dev|prod|test -> the file that environment owns
   case "$1" in
@@ -128,12 +282,8 @@ ensure_env_dev() { # [http-port] — generate .env.dev on first boot only
   EF="$(active_env_file dev)"
   [ -n "$EF" ] && return 0
   need_bin openssl "openssl is required to generate secrets"
-  local args=(--env dev --env-file "$DEV_ENV_FILE")
-  [ -n "$port" ] && args+=(--http-port "$port")
-  [ -n "${ADMIN_EMAIL:-}" ] && args+=(--admin-email "$ADMIN_EMAIL")
-  mkdir -p "$(dirname "$DEV_ENV_FILE")"
   note "first boot: generating $DEV_ENV_FILE"
-  "$INSTALL_SH" "${args[@]}"
+  generate_env_file dev "$DEV_ENV_FILE" "" "" "" "" "$port" "" "${ADMIN_EMAIL:-}"
   EF="$DEV_ENV_FILE"
 }
 
@@ -148,16 +298,9 @@ ensure_env_prod() { # requires PROD_* globals when the file does not exist yet
   fi
   [ -n "${PROD_DOMAIN:-}" ] || die "the first prod boot needs --domain (e.g. ./hera prod up --domain books.example.com)"
   need_bin openssl "openssl is required to generate secrets"
-  local args=(--env prod --domain "$PROD_DOMAIN" --env-file "$PROD_ENV_FILE")
-  [ -n "${PROD_PIN:-}" ] && args+=(--pin "$PROD_PIN")
-  [ -n "${PROD_CHANNEL:-}" ] && args+=(--channel "$PROD_CHANNEL")
-  [ -n "${PROD_ACME_EMAIL:-}" ] && args+=(--acme-email "$PROD_ACME_EMAIL")
-  [ -n "${PROD_HTTP_PORT:-}" ] && args+=(--http-port "$PROD_HTTP_PORT")
-  [ -n "${PROD_HTTPS_PORT:-}" ] && args+=(--https-port "$PROD_HTTPS_PORT")
-  [ -n "${ADMIN_EMAIL:-}" ] && args+=(--admin-email "$ADMIN_EMAIL")
-  mkdir -p "$(dirname "$PROD_ENV_FILE")"
   note "first boot: generating $PROD_ENV_FILE"
-  "$INSTALL_SH" "${args[@]}"
+  generate_env_file prod "$PROD_ENV_FILE" "$PROD_DOMAIN" "${PROD_PIN:-}" "${PROD_CHANNEL:-}" \
+    "${PROD_ACME_EMAIL:-}" "${PROD_HTTP_PORT:-}" "${PROD_HTTPS_PORT:-}" "${ADMIN_EMAIL:-}"
   EF="$PROD_ENV_FILE"
 }
 
@@ -239,12 +382,12 @@ preflight_port() { # PORT ENV — refuse before pulling when someone holds the p
   local port="$1" env="$2" holders mine id rest foreign=""
   tcp_port_busy "$port" || return 0
   mine="$("${COMPOSE[@]}" ps -aq 2>/dev/null | tr '\n' ' ' || true)"
-  holders="$(docker ps --no-trunc --filter "publish=$port" --format '{{.ID}}|{{.Names}}' 2>/dev/null || true)"
+  holders="$(docker ps --no-trunc --filter "publish=$port" --format '{{.ID}}|{{.Names}}|{{.Ports}}' 2>/dev/null || true)"
   if [ -n "$holders" ]; then
     while IFS='|' read -r id rest; do
       [ -n "${id:-}" ] || continue
       case " $mine " in *" $id "*) continue ;; esac
-      foreign="yes"
+      foreign="${foreign}    ${rest}"$'\n'
     done <<< "$holders"
     if [ -z "$foreign" ]; then
       note "host port $port is published by this stack's own proxy — it will be recreated"
@@ -253,6 +396,12 @@ preflight_port() { # PORT ENV — refuse before pulling when someone holds the p
   fi
   echo "" >&2
   echo "hera: error: host port $port is already in use — the proxy (Caddy) cannot bind it." >&2
+  if [ -n "$foreign" ]; then
+    echo "  Another container is publishing it:" >&2
+    printf '%s' "$foreign" >&2
+  else
+    echo "  A host process (not a container) is listening on it." >&2
+  fi
   echo "  Stop that listener and re-run, or move Hera onto a free port:" >&2
   if [ "$env" = "prod" ]; then
     echo "    ./hera prod up --http-port <free> --https-port <free>" >&2
@@ -264,32 +413,111 @@ preflight_port() { # PORT ENV — refuse before pulling when someone holds the p
   exit 1
 }
 
-up_failed() { # ENV — compact post-mortem: states, then the implicated logs
-  local env="$1" service log_out
+container_detail() { # NAME — status|exit|error|health
+  docker inspect --format \
+    '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Error}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "$1" 2>/dev/null || true
+}
+
+up_failed() { # ENV — compact post-mortem: states, cause, then service logs
+  local env="$1" service name state detail status exit_code error health line log_out
+  local states cause="unknown" culprit="" blob="" migrate_exit=""
+  local -a failed=()
+
+  states="$("${COMPOSE[@]}" ps -a --format '{{.Service}}|{{.Name}}|{{.State}}' 2>/dev/null || true)"
   echo "" >&2
   echo "hera: the $env stack did not come up healthy." >&2
   echo "" >&2
-  "${COMPOSE[@]}" ps -a >&2 || true
+  echo "service states:" >&2
+  if [ -n "$states" ]; then
+    while IFS='|' read -r service name state; do
+      [ -n "${service:-}" ] || continue
+      detail="$(container_detail "$name")"
+      status="${state:-unknown}"; exit_code=""; error=""; health="none"
+      if [ -n "$detail" ]; then
+        status="${detail%%|*}"; detail="${detail#*|}"
+        exit_code="${detail%%|*}"; detail="${detail#*|}"
+        error="${detail%|*}"; health="${detail##*|}"
+        blob="${blob} ${error}"
+        [ "$service" = migrate ] && migrate_exit="$exit_code"
+      fi
+      case "$status" in
+        running)
+          case "$health" in
+            healthy) line="running (healthy)" ;;
+            starting) line="running (healthcheck still starting)" ;;
+            none) line="running" ;;
+            *) line="RUNNING BUT UNHEALTHY"; failed+=("$service") ;;
+          esac ;;
+        exited)
+          if [ "$exit_code" = "0" ]; then line="exited 0 (one-shot: success)"
+          else line="EXITED ${exit_code:-?}"; failed+=("$service"); fi ;;
+        created) line="created — never started"; failed+=("$service") ;;
+        *) line="$status"; failed+=("$service") ;;
+      esac
+      printf '  %-10s %s\n' "$service" "$line" >&2
+      [ -n "$error" ] && printf '  %-10s   %s\n' "" "$error" >&2
+    done <<< "$states"
+  else
+    echo "  (no containers were reported — the failure happened before any started)" >&2
+    "${COMPOSE[@]}" ps -a >&2 || true
+  fi
+
+  culprit="$(printf '%s\n' "$blob" | sed -n \
+    -e 's/.*failed to bind host port [0-9.]*:\([0-9][0-9]*\)\/.*/\1/p' \
+    -e 's/.*listen tcp[46]*[[:space:]]\[*[0-9a-fA-F:.]*\]*:\([0-9][0-9]*\): bind: address already in use.*/\1/p' \
+    | head -n 1)"
+  if printf '%s' "$blob" | grep -qi 'address already in use'; then
+    cause="port"
+  elif [ -n "$migrate_exit" ] && [ "$migrate_exit" != "0" ]; then
+    cause="migrate"
+  elif [ "${#failed[@]}" -gt 0 ]; then
+    cause="crash"
+  elif printf '%s' "$blob" | grep -qiE 'unhealthy|dependency failed to start'; then
+    cause="unhealthy"
+  fi
+
   echo "" >&2
-  echo "hera: last logs of the services involved:" >&2
-  for service in web migrate api worker db redis proxy; do
+  case "$cause" in
+    port) echo "cause: host port ${culprit:-?} is already in use — the proxy cannot bind it" >&2 ;;
+    migrate) echo "cause: the one-shot migrate service failed; api and worker wait on it" >&2 ;;
+    crash) echo "cause: ${failed[*]:-a service} exited or never started" >&2 ;;
+    unhealthy) echo "cause: a container started but never passed its healthcheck in time" >&2 ;;
+    *) echo "cause: not one of the known first-boot causes — the logs below are the evidence" >&2 ;;
+  esac
+
+  echo "" >&2
+  echo "last logs:" >&2
+  for service in web migrate api worker db redis proxy backup; do
     echo "---------------- $service ----------------" >&2
-    log_out="$("${COMPOSE[@]}" logs --tail 40 "$service" 2>/dev/null || true)"
+    log_out="$("${COMPOSE[@]}" logs --tail 60 "$service" 2>/dev/null || true)"
     if [ -n "$log_out" ]; then printf '%s\n' "$log_out" >&2; else echo "(no output)" >&2; fi
   done
+
   echo "" >&2
   echo "hints:" >&2
-  echo "  - migrate EXITED non-zero: read its error above. Only a never-used site" >&2
-  echo "    may be wiped (./hera $env down --volumes); a site WITH data must be" >&2
-  echo "    fixed or restored, never wiped." >&2
-  echo "  - api/worker ImportError after a git pull: the venv is baked into the" >&2
-  echo "    image — rebuild it (./hera dev build api worker)." >&2
-  echo "  - web restarting after a git pull: read its npm/Vite error above." >&2
-  echo "    The dev/test web startup checks package manifests against node_modules;" >&2
-  echo "    if npm ci fails, fix the registry/network/disk error, then retry up." >&2
-  echo "    Never delete database volumes to repair frontend dependencies." >&2
-  echo "  - full state: ./hera $env ps -a · follow one: ./hera logs $env <service>" >&2
-  echo "  - every cause and remedy: docs/deployment.md (troubleshooting)." >&2
+  case "$cause" in
+    port)
+      echo "  - this is a host port conflict, not a schema or data problem; do NOT wipe volumes for it." >&2
+      echo "  - stop the listener, or move Hera onto free ports:" >&2
+      if [ "$env" = prod ]; then
+        echo "      ./hera prod up --http-port <free> --https-port <free>" >&2
+        echo "    Caddy automatic HTTPS expects public 80/443 unless you put your own TLS proxy in front." >&2
+      else
+        echo "      ./hera $env up --port <free>" >&2
+      fi ;;
+    migrate)
+      echo "  - read the migrate log above. Only a never-used site may be wiped:" >&2
+      echo "      ./hera $env down --volumes" >&2
+      echo "    A site WITH data must be fixed or restored, never wiped." >&2 ;;
+    crash|unhealthy|unknown)
+      echo "  - read the service log above for the service named in the cause." >&2
+      echo "  - after dependency changes in dev, rebuild with: ./hera dev build api worker" >&2
+      echo "  - never delete database volumes to repair frontend dependencies." >&2 ;;
+  esac
+  echo "  - full state: ./hera $env ps -a" >&2
+  echo "  - follow one service: ./hera logs $env <service>" >&2
+  echo "  - reference: docs/deployment.md (troubleshooting)." >&2
 }
 
 site_url_for() { # ENV — the desk URL, read back from the env file in force
@@ -597,15 +825,15 @@ cmd_prod_update() { # --pin vX.Y.Z | --channel stable|beta
   fi
   EF="$(active_env_file prod)"
   [ -n "$EF" ] || die "no prod env file yet (run ./hera prod up first)"
-  local repo="${HERA_REPO:-MartinKyng/Hera-Operating-System}"
-  [ "$repo" = MartinKyng/Hera-Operating-System ] || die "production uses only the public release repository"
+  local repo="${HERA_REPO:-$PUBLIC_REPO}"
+  [ "$repo" = "$PUBLIC_REPO" ] || die "production uses only the public release repository"
   local override
   for override in HERA_API_IMAGE HERA_WEB_IMAGE; do
     [ -z "${!override+x}" ] || validate_hub_image "$override" "${!override}"
   done
   local api_image web_image api_digest="" web_digest="" pg_digest="" rd_digest="" cd_digest=""
-  api_image="$(env_value HERA_API_IMAGE "$EF" "docker.io/kyngroyalty/hera-os")"
-  web_image="$(env_value HERA_WEB_IMAGE "$EF" "docker.io/kyngroyalty/hera-os")"
+  api_image="$(env_value HERA_API_IMAGE "$EF" "$DEFAULT_API_IMAGE")"
+  web_image="$(env_value HERA_WEB_IMAGE "$EF" "$DEFAULT_WEB_IMAGE")"
 
   if [ -n "$pin" ]; then
     need_bin curl "--pin needs curl to fetch the release manifest"
@@ -622,8 +850,8 @@ cmd_prod_update() { # --pin vX.Y.Z | --channel stable|beta
     rd_digest="$(digest_of HERA_REDIS_DIGEST)"
     cd_digest="$(digest_of HERA_CADDY_DIGEST)"
   else
-    api_image="docker.io/kyngroyalty/hera-os"
-    web_image="docker.io/kyngroyalty/hera-os"
+    api_image="$DEFAULT_API_IMAGE"
+    web_image="$DEFAULT_WEB_IMAGE"
     need_docker
     pulled_digest() {
       docker pull --quiet "$1" >/dev/null 2>&1 || return 1
@@ -929,16 +1157,17 @@ backup_service_for() { # ENV — prod has a sidecar; dev/test back up through ap
   if [ "$1" = "prod" ]; then printf 'backup'; else printf 'api'; fi
 }
 
-cmd_backup() { # ENV [--list] [--restore FILE] [--yes] [--no-upload] [--retain-days N] [--out DIR]
+cmd_backup() { # ENV [--list] [--restore FILE] [--import FILE] [--yes] [--no-upload] [--retain-days N] [--out DIR]
   if [ $# -eq 0 ]; then usage_backup; return 0; fi
   local env="$1"
   shift
   case "$env" in dev|prod|test) ;; -h|--help) usage_backup; exit 0 ;; *) die "unknown environment: $env (want dev, prod or test)" ;; esac
-  local list=0 restore_file="" no_upload=0 retain_days="" out=""; ASSUME_YES=0
+  local list=0 restore_file="" import_file="" no_upload=0 retain_days="" out=""; ASSUME_YES=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --list) list=1; shift ;;
       --restore) need_arg "$1" "${2:-}"; restore_file="$2"; shift 2 ;;
+      --import) need_arg "$1" "${2:-}"; import_file="$2"; shift 2 ;;
       --yes) ASSUME_YES=1; shift ;;
       --no-upload) no_upload=1; shift ;;
       --retain-days) need_arg "$1" "${2:-}"; retain_days="$2"; shift 2 ;;
@@ -947,7 +1176,7 @@ cmd_backup() { # ENV [--list] [--restore FILE] [--yes] [--no-upload] [--retain-d
       *) die "unknown flag for backup: $1 (see ./hera backup --help)" ;;
     esac
   done
-  [ "$list" = "1" ] && [ -n "$restore_file" ] && die "--list and --restore cannot be combined"
+  [ "$list" = "1" ] && [ -n "$restore_file$import_file" ] && die "--list cannot be combined with --restore or --import"
   if [ -n "$retain_days" ]; then
     [[ "$retain_days" =~ ^[1-9][0-9]*$ ]] || die "--retain-days must be a positive integer"
   fi
@@ -957,6 +1186,17 @@ cmd_backup() { # ENV [--list] [--restore FILE] [--yes] [--no-upload] [--retain-d
   compose_for "$env"
   local svc
   svc="$(backup_service_for "$env")"
+
+  if [ -n "$import_file" ]; then
+    [ -r "$import_file" ] || die "import file is not readable: $import_file"
+    require_up "$env"
+    local imported_name imported_dest
+    imported_name="$(basename "$import_file")"
+    imported_dest="/backups/$imported_name"
+    note "importing $import_file into the $env backup volume as $imported_dest …"
+    "${COMPOSE[@]}" cp "$import_file" "api:$imported_dest"
+    [ -n "$restore_file" ] || { note "imported — restore with: ./hera backup $env --restore $imported_name"; return 0; }
+  fi
 
   if [ "$list" = "1" ]; then
     require_up "$env"
@@ -1051,8 +1291,7 @@ Per-command help:
   ./hera logs --help     ./hera apps --help         prod also has update)
   ./hera backup --help
 
-Full reference (every flag, every customization, raw docker compose
-equivalents): docs/deployment.md
+Full reference: README.md; source checkouts also include docs/deployment.md.
 EOF
 }
 
@@ -1108,10 +1347,9 @@ Flags (first boot persists them into the env file; later they apply one-shot):
   --fresh --yes          wipe volumes first (DANGER: deletes all prod data)
   --no-wait              do not wait for health (debugging only)
 
-With only the downloaded hera file, this command clones the public deployment
-bundle automatically (Git, Docker/Compose, curl and OpenSSL required).
-The private source repository is never cloned. The legacy install.sh entry —
-see docs/deployment.md (no-clone path).
+Run this from the public release repository clone for production. If the hera
+file is downloaded alone, it can still fetch the same public deployment bundle,
+but the recommended path is: git clone the public repo, then run ./hera.
 EOF
   else
     cat <<'EOF'
@@ -1247,7 +1485,6 @@ usage_logs() {
   --since X      only logs since X (e.g. 1h, 2026-09-01T00:00:00Z)
 
 Services: api worker web proxy db redis migrate (plus backup on prod, e2e on test).
-Raw equivalent: docker compose --env-file <env> -f <file> -p <project> logs -f [service]
 EOF
 }
 
@@ -1285,13 +1522,16 @@ Dumps are hera-YYYYmmdd-HHMMSS.dump.
   ./hera backup prod --list       list the dumps on the volume
   ./hera backup prod --no-upload  skip the S3 copy this once
   ./hera backup prod --retain-days 30 --out /backups/audit
+  ./hera backup prod --import /secure/hera-20260101-000000.dump
+                                  copy a host dump into the backup volume
   ./hera backup prod --restore hera-20260101-000000.dump
                                   REPLACE the database with a dump (asks first;
                                   writers stop; restart only after success)
 
 --restore takes a path inside the container (/backups/...) or a bare dump
-name. Never test a restore over the only copy of production — drill on a
-throwaway project first (docs/runbook.md section 4).
+name. --import takes a host path and stores it as /backups/<name> first. Never
+test a restore over the only copy of production — drill on a throwaway project
+first (docs/runbook.md section 4).
 EOF
 }
 
@@ -1299,7 +1539,7 @@ EOF
 # credentials or application source is needed. Keep state outside release trees.
 bootstrap_public() {
   local args=("$@") arg pin="" channel="" ref="main" refresh=0
-  local public_repo="MartinKyng/Hera-Operating-System"
+  local public_repo="$PUBLIC_REPO"
   [ "${HERA_REPO:-$public_repo}" = "$public_repo" ] || die "production bootstrap uses only the public release repository $public_repo"
   for arg in "$@"; do
     case "$arg" in -h|--help) return 0 ;; esac
@@ -1334,7 +1574,7 @@ bootstrap_public() {
       rm -rf "$stage"
       die "could not download the public release $ref; previous deployment is unchanged"
     fi
-    for file in hera deploy/install.sh deploy/docker-compose.prod.yml deploy/Caddyfile.prod deploy/postgres/init-roles.sh deploy/Dockerfile .env.example VERSION; do
+    for file in hera deploy/docker-compose.prod.yml deploy/Caddyfile.prod deploy/postgres/init-roles.sh deploy/Dockerfile .env.example VERSION; do
       if [ ! -f "$stage/$file" ] || [ -L "$stage/$file" ]; then
         rm -rf "$stage"
         die "public release $ref is missing $file; publish the new deployment bundle first"
@@ -1345,7 +1585,7 @@ bootstrap_public() {
     if [ -e "$stage/services" ] || [ -e "$stage/apps" ]; then
       rm -rf "$stage"; die "public deployment bundle unexpectedly contains application source"
     fi
-    chmod +x "$stage/hera" "$stage/deploy/install.sh"
+    chmod +x "$stage/hera"
   fi
   # The project name and state paths never depend on the cloned release name.
   # Prior release trees remain available for operator-led rollback; no volumes
@@ -1363,6 +1603,22 @@ bootstrap_public() {
     exit "$status"
   fi
   exec "$current/hera" "${args[@]}"
+}
+
+guard_public_bundle_command() {
+  # The public repository is intentionally source-free. It can operate an
+  # existing production stack, but dev/test need the private source checkout.
+  [ -f "$COMPOSE_BASE" ] && return 0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in -h|--help) return 0 ;; esac
+  done
+  case "${1:-}" in
+    help|-h|--help|version|--version|-V|"") return 0 ;;
+    prod) return 0 ;;
+    backup|logs|seed|apps) [ "${2:-}" = "prod" ] && return 0 ;;
+  esac
+  die "development and test commands require the source checkout; the public repository supports production only"
 }
 
 valid_release_pin() {
@@ -1401,5 +1657,6 @@ main() {
   esac
 }
 
-[ -f "$INSTALL_SH" ] || bootstrap_public "$@"
+[ -f "$COMPOSE_PROD" ] || bootstrap_public "$@"
+guard_public_bundle_command "$@"
 main "$@"
